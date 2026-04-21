@@ -140,6 +140,8 @@ class EastmoneyAPI:
         Returns:
             上市收盘价，获取失败返回 None
         """
+        import gzip
+        
         market = '1' if bond_code.startswith('11') else '0'
         date_str = listing_date.replace('-', '')
         
@@ -153,12 +155,22 @@ class EastmoneyAPI:
             f"lmt=5"
         )
         
-        data = self._request(url)
-        if data and data.get('data') and data['data'].get('klines'):
-            kline = data['data']['klines'][0]
-            parts = kline.split(',')
-            if len(parts) >= 3:
-                return float(parts[2])  # 收盘价
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                raw_data = response.read()
+                # 处理 gzip 压缩
+                if response.headers.get('Content-Encoding') == 'gzip' or raw_data[:2] == b'\x1f\x8b':
+                    raw_data = gzip.decompress(raw_data)
+                data = json.loads(raw_data.decode('utf-8'))
+                
+                if data and data.get('data') and data['data'].get('klines'):
+                    kline = data['data']['klines'][0]
+                    parts = kline.split(',')
+                    if len(parts) >= 3:
+                        return float(parts[2])  # 收盘价
+        except Exception as e:
+            print(f"获取上市价格失败 {bond_code}: {e}")
         
         return None
 

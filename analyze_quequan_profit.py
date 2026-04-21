@@ -171,19 +171,26 @@ def run_offline(limit: int = 5) -> list:
     return analyses
 
 
-def run_online(limit: int = 0, year: int = 0, month: int = 0) -> list:
+def run_online(limit: int = 0, year: int = 0, month: int = 0, from_month: int = 0) -> list:
     """
     在线模式：从 API 获取实时数据
     
     Args:
         limit: 分析数量 (0=全部)
         year: 筛选年份 (默认 2026)
+        month: 指定月份 (0=全年)
+        from_month: 从该月份开始 (用于分析 X 月至今)
         
     Returns:
         分析结果列表
     """
     print("数据来源：东方财富 + 新浪财经")
-    print(f"筛选条件：{year}年上市")
+    if from_month > 0:
+        print(f"筛选条件：{year}年{from_month}月至今")
+    elif month > 0:
+        print(f"筛选条件：{year}年{month}月")
+    else:
+        print(f"筛选条件：{year}年上市")
     print()
     
     # 初始化数据源
@@ -211,11 +218,17 @@ def run_online(limit: int = 0, year: int = 0, month: int = 0) -> list:
         if not listing_date.startswith(str(year)):
             continue
         
-        # 月份筛选 (格式：YYYY-MM-DD)
-        if month > 0:
-            date_parts = listing_date.split('-')
-            if len(date_parts) >= 2:
-                bond_month = int(date_parts[1])
+        # 月份筛选
+        date_parts = listing_date.split('-')
+        if len(date_parts) >= 2:
+            bond_month = int(date_parts[1])
+            
+            # 如果指定了 from_month，筛选该月及之后
+            if from_month > 0:
+                if bond_month < from_month:
+                    continue
+            # 如果指定了 month，只筛选该月
+            elif month > 0:
                 if bond_month != month:
                     continue
         
@@ -338,6 +351,13 @@ def main():
     )
     
     parser.add_argument(
+        '--from-month',
+        type=int,
+        default=0,
+        help='分析指定月份及之后上市的转债 (默认：0=全年)'
+    )
+    
+    parser.add_argument(
         '--offline',
         action='store_true',
         help='使用离线测试数据 (不调用 API)'
@@ -377,7 +397,7 @@ def main():
     if args.offline:
         analyses = run_offline(limit=args.limit if args.limit > 0 else 5)
     else:
-        analyses = list(run_online(limit=args.limit, year=args.year, month=args.month))
+        analyses = list(run_online(limit=args.limit, year=args.year, month=args.month, from_month=args.from_month))
     
     if not analyses:
         print("没有分析结果")
