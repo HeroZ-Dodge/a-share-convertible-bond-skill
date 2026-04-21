@@ -1,36 +1,33 @@
 ---
 name: a-share-convertible-bond
-description: 跟踪 A 股可转债新债发布，计算配债额度，分析抢权配债收益。使用场景：(1) 监控新债发行信息；(2) 计算配债额度和所需资金；(3) 上帝视角分析历史收益；(4) 抓取东方财富/新浪财经数据。
+description: 跟踪 A 股可转债新债发布，计算配债额度，分析抢权配债收益。使用场景：(1) 监控新债发行信息；(2) 计算配债额度和所需资金；(3) 上帝视角分析历史收益；(4) 抓取集思录/东方财富/新浪财经数据。
 ---
 
 # A 股可转债分析技能
 
 本技能用于跟踪 A 股市场可转债新债发行信息，进行抢权配债完整收益分析。
 
+**✨ 新增功能**：从集思录获取待发转债信息，**公告发布前即可发现配债机会**！
+
 ## 快速开始
 
-### 默认：输出完整报告
+### 🆕 待发转债列表 (公告前即可获取)
 
 ```bash
-python analyze_quequan_profit.py
+# 查看待发转债 (集思录数据)
+python analyze_pending.py
+
+# 紧凑摘要模式 (推荐)
+python analyze_pending.py --compact
+
+# 查看前 5 只
+python analyze_pending.py --limit 5
+
+# 为第 1 只转债计算配债额度
+python analyze_pending.py --calc 1
 ```
 
-**自动检测输出长度**：
-- 如果报告较短 → 直接显示完整报告
-- 如果报告较长 (>200 行) → 显示完整报告 + 提示使用紧凑模式
-
-### 紧凑摘要模式 (推荐用于聊天)
-
-```bash
-python analyze_quequan_profit.py --compact
-```
-
-输出包含：
-- 股价走势 (T-1 → T+1)
-- T-1 买入完整盈亏 (全部数据)
-- 统计汇总
-
-### 命令行参数
+### 历史收益分析 (上帝视角)
 
 ```bash
 # 完整报告 (默认)
@@ -79,16 +76,33 @@ analysis = calc.analyze_quequan_profit(bond_info, stock_prices)
 
 ### 数据获取
 
+#### 统一数据源接口 (推荐)
+
 ```python
-from lib.data_source import EastmoneyAPI, SinaFinanceAPI
+from lib.data_source import BondDataSource
 
+# 自动优先集思录，失败降级东方财富
+ds = BondDataSource()
+bonds, source = ds.fetch_bonds(limit=10, pending_only=True)
+
+print(f"数据来源：{source}")  # 'jisilu' 或 'eastmoney'
+```
+
+#### 直接使用各数据源
+
+```python
+from lib.data_source import JisiluAPI, EastmoneyAPI, SinaFinanceAPI
+
+# 获取待发转债 (集思录 - 公告前即可获取)
+jsl = JisiluAPI()
+pending_bonds = jsl.fetch_pending_bonds(limit=10)
+
+# 获取已上市转债列表 (东方财富)
 em = EastmoneyAPI()
-sina = SinaFinanceAPI()
-
-# 获取转债列表
 bonds = em.fetch_listed_bonds(limit=10)
 
-# 获取股票历史价格
+# 获取股票历史价格 (新浪财经)
+sina = SinaFinanceAPI()
 prices = sina.fetch_history('300622', days=90)
 
 # 获取上市价格
@@ -107,10 +121,18 @@ listing_close = em.fetch_bond_listing_price('118050', '2026-04-14')
 
 ## 数据源
 
+### 集思录 (待发转债) ⭐ 推荐
+- URL: https://www.jisilu.cn/data/cbnew/#pre
+- API: `/data/cbnew/pre_list/`
+- **优势：公告发布前即可获取申购信息**
+- 数据包含：申购代码、配售代码、股权登记日、每股配售额、发行规模
+- 无需登录即可访问 API
+
 ### 东方财富网 (转债数据)
 - URL: https://data.eastmoney.com/kzz/
 - API: datacenter-web.eastmoney.com
 - 数据完整、更新及时
+- 适合获取已上市转债的历史数据
 
 ### 新浪财经 (股票历史价格)
 - URL: http://money.finance.sina.com.cn/
@@ -134,15 +156,20 @@ listing_close = em.fetch_bond_listing_price('118050', '2026-04-14')
 3. **配债成本**: 根据每股配售额动态计算，非固定值
 4. **破发风险**: 新债上市可能跌破 100 元发行价
 5. **抢权风险**: 为配债买入股票可能面临股价下跌
+6. **数据源优先级**: 
+   - 优先使用集思录 (待发转债，公告前即可获取)
+   - 集思录不可用时自动降级到东方财富
+   - 使用 `BondDataSource` 类可自动处理降级
 
 ## 目录结构
 
 ```
 a-share-convertible-bond/
-├── analyze_quequan_profit.py    # 主脚本 (完整报告 + 紧凑模式)
+├── analyze_quequan_profit.py    # 主脚本 (历史收益分析)
 ├── analyze_compact.py           # 紧凑摘要 (独立脚本)
+├── analyze_pending.py           # 🆕 待发转债分析 (集思录数据)
 ├── lib/                         # 核心模块
-│   ├── data_source.py           # 数据源接口
+│   ├── data_source.py           # 数据源接口 (集思录/东方财富/新浪财经)
 │   ├── bond_calculator.py       # 配债计算
 │   └── report.py                # 报告生成
 └── reference/                   # 参考资料
