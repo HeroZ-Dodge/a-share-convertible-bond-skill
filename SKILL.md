@@ -165,13 +165,32 @@ listing_close = em.fetch_bond_listing_price('118050', '2026-04-14')
 
 ```
 a-share-convertible-bond/
-├── analyze_quequan_profit.py    # 主脚本 (历史收益分析)
-├── analyze_compact.py           # 紧凑摘要 (独立脚本)
-├── analyze_pending.py           # 🆕 待发转债分析 (集思录数据)
-├── lib/                         # 核心模块
+├── README.md                    # 使用说明
+├── SKILL.md                     # 技能定义
+├── monitor_history.json         # 监控历史记录
+│
+├── lib/                         # 📚 核心库模块 (可复用)
 │   ├── data_source.py           # 数据源接口 (集思录/东方财富/新浪财经)
-│   ├── bond_calculator.py       # 配债计算
-│   └── report.py                # 报告生成
-└── reference/                   # 参考资料
+│   ├── bond_calculator.py       # 配债计算模块
+│   ├── report.py                # 报告生成模块
+│   └── stock_quality.py         # 🆕 股票质量评估模块
+│
+├── scripts/                     # 🛠️ 分析脚本
+│   ├── monitor/                 # 🎯 潜伏策略监控 (带自我进化)
+│   │   ├── monitor_latent_strategy.py   # 潜伏策略监控主脚本 🧬
+│   │   ├── backtest_latent_strategy.py  # 潜伏策略回测
+│   │   ├── README.md                    # 使用说明
+│   │   └── 潜伏策略监控使用说明.md       # 详细文档
+│   ├── analyze_*.py             # 分析脚本 (8 个)
+│   └── backtest_*.py            # 回测脚本 (1 个：潜伏策略)
+│
+├── docs/                        # 📖 分析报告文档
+│   ├── 策略综合分析与推荐.md
+│   ├── 潜伏策略_消息泄露信号挖掘.md   # 🆕
+│   └── ...
+│
+└── reference/                   # 📚 参考资料
     └── bond-rules.md            # 配债规则
 ```
+
+详见：[docs/目录结构说明.md](docs/目录结构说明.md)

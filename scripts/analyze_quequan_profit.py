@@ -36,7 +36,7 @@ import sys
 import os
 
 # 添加 lib 目录到路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lib.data_source import EastmoneyAPI, SinaFinanceAPI
 from lib.bond_calculator import BondCalculator, QuequanAnalysis
