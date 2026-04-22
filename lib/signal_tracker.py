@@ -90,7 +90,24 @@ class SignalTracker:
         latest_close = prices[latest_date]['close']
         
         # 计算持有天数
-        signal_dt = datetime.strptime(signal_date, '%Y-%m-%d')
+        if not signal_date:
+            signal_date = sorted_dates[0] if sorted_dates else ''
+        
+        if not signal_date:
+            return {
+                'bond_code': bond_code,
+                'status': 'error',
+                'message': '无可用日期数据',
+            }
+        
+        try:
+            signal_dt = datetime.strptime(signal_date, '%Y-%m-%d')
+        except ValueError:
+            return {
+                'bond_code': bond_code,
+                'status': 'error',
+                'message': f'日期格式错误: {signal_date}',
+            }
         today_dt = datetime.now()
         hold_days = (today_dt - signal_dt).days
         

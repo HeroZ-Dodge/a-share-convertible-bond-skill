@@ -157,10 +157,10 @@ def monitor_latent_strategy(save_data: bool = True, auto_evolve: bool = True, us
     monitoring_list = []
     
     for b in bonds:
-        bond_name = b.get('bond_name') or 'N/A'
-        bond_code = b.get('bond_code', '')
-        stock_code = b.get('stock_code', '')
         stock_name = b.get('stock_name') or 'N/A'
+        bond_name = b.get('bond_name') or (stock_name + '转债' if stock_name != 'N/A' else 'N/A')
+        bond_code = b.get('bond_code', '') or stock_code
+        stock_code = b.get('stock_code', '')
         progress_full = b.get('progress_full', '')
         
         dates = parse_progress_dates(progress_full)

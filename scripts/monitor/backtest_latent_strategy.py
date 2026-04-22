@@ -23,19 +23,19 @@ from lib.stock_quality import StockQualityEvaluator
 # 来源：可转债同意注册后股价变化分析_2025-2026.md + 可转债同意注册前提前布局策略.md
 HISTORICAL_DATA = [
     # 债券，股票代码，上市委通过日，同意注册日，注册前 10 天价，注册前 5 天价，注册日价
-    {'bond': '金杨转债', 'stock': '301210', 'tongguo_date': '2026-02-11', 'zhuce_date': '2026-03-31', 'price_10d': 36.62, 'price_5d': 36.62, 'price_0d': 38.53},
-    {'bond': '本川转债', 'stock': '300622', 'tongguo_date': '2026-02-10', 'zhuce_date': '2026-04-01', 'price_10d': 67.51, 'price_5d': 67.51, 'price_0d': 71.52},
-    {'bond': '珂玛转债', 'stock': '300447', 'tongguo_date': '2026-02-06', 'zhuce_date': '2026-03-30', 'price_10d': 92.35, 'price_5d': 92.35, 'price_0d': 101.86},
-    {'bond': '斯达转债', 'stock': '603290', 'tongguo_date': '2026-01-30', 'zhuce_date': '2026-03-12', 'price_10d': 98.12, 'price_5d': 98.12, 'price_0d': 109.06},
-    {'bond': 'N/A-5', 'stock': '688668', 'tongguo_date': '2026-02-11', 'zhuce_date': '2026-04-21', 'price_10d': 34.54, 'price_5d': 34.54, 'price_0d': 35.51},
-    {'bond': 'N/A-6', 'stock': '688480', 'tongguo_date': '2026-02-04', 'zhuce_date': '2026-04-13', 'price_10d': 16.57, 'price_5d': 16.57, 'price_0d': 18.79},
-    {'bond': 'N/A-7', 'stock': '603112', 'tongguo_date': '2026-02-07', 'zhuce_date': '2026-04-08', 'price_10d': 36.38, 'price_5d': 36.38, 'price_0d': 36.90},
-    {'bond': 'N/A-8', 'stock': '688200', 'tongguo_date': '2026-02-04', 'zhuce_date': '2026-04-07', 'price_10d': 13.47, 'price_5d': 13.47, 'price_0d': 13.52},
-    {'bond': 'N/A-9', 'stock': '603339', 'tongguo_date': '2026-02-11', 'zhuce_date': '2026-04-02', 'price_10d': 47.14, 'price_5d': 47.14, 'price_0d': 46.92},
-    {'bond': 'N/A-10', 'stock': '301018', 'tongguo_date': '2026-02-04', 'zhuce_date': '2026-04-01', 'price_10d': 28.65, 'price_5d': 28.65, 'price_0d': 28.95},
-    {'bond': 'N/A-11', 'stock': '688686', 'tongguo_date': '2026-01-30', 'zhuce_date': '2026-03-18', 'price_10d': 9.11, 'price_5d': 9.11, 'price_0d': 9.02},
-    {'bond': 'N/A-12', 'stock': '300953', 'tongguo_date': '2025-11-14', 'zhuce_date': '2025-12-31', 'price_10d': None, 'price_5d': None, 'price_0d': 233.44},
-    {'bond': 'N/A-13', 'stock': '001380', 'tongguo_date': '2025-11-20', 'zhuce_date': '2025-12-31', 'price_10d': None, 'price_5d': None, 'price_0d': 277.73},
+    {'bond': '金杨转债', 'stock': '301210', 'stock_name': '金杨精密', 'tongguo_date': '2026-02-11', 'zhuce_date': '2026-03-31', 'price_10d': 36.62, 'price_5d': 36.62, 'price_0d': 38.53},
+    {'bond': '本川转债', 'stock': '300622', 'stock_name': '博士眼镜', 'tongguo_date': '2026-02-10', 'zhuce_date': '2026-04-01', 'price_10d': 67.51, 'price_5d': 67.51, 'price_0d': 71.52},
+    {'bond': '珂玛转债', 'stock': '300447', 'stock_name': '珂玛科技', 'tongguo_date': '2026-02-06', 'zhuce_date': '2026-03-30', 'price_10d': 92.35, 'price_5d': 92.35, 'price_0d': 101.86},
+    {'bond': '斯达转债', 'stock': '603290', 'stock_name': '斯达半导', 'tongguo_date': '2026-01-30', 'zhuce_date': '2026-03-12', 'price_10d': 98.12, 'price_5d': 98.12, 'price_0d': 109.06},
+    {'bond': '鼎通转债', 'stock': '688668', 'stock_name': '鼎通科技', 'tongguo_date': '2026-02-11', 'zhuce_date': '2026-04-21', 'price_10d': 34.54, 'price_5d': 34.54, 'price_0d': 35.51},
+    {'bond': '赛恩斯转债', 'stock': '688480', 'stock_name': '赛恩斯', 'tongguo_date': '2026-02-04', 'zhuce_date': '2026-04-13', 'price_10d': 16.57, 'price_5d': 16.57, 'price_0d': 18.79},
+    {'bond': '华翔转债', 'stock': '603112', 'stock_name': '华翔股份', 'tongguo_date': '2026-02-07', 'zhuce_date': '2026-04-08', 'price_10d': 36.38, 'price_5d': 36.38, 'price_0d': 36.90},
+    {'bond': '华峰转债', 'stock': '688200', 'stock_name': '华峰测控', 'tongguo_date': '2026-02-04', 'zhuce_date': '2026-04-07', 'price_10d': 13.47, 'price_5d': 13.47, 'price_0d': 13.52},
+    {'bond': '四方转债', 'stock': '603339', 'stock_name': '四方科技', 'tongguo_date': '2026-02-11', 'zhuce_date': '2026-04-02', 'price_10d': 47.14, 'price_5d': 47.14, 'price_0d': 46.92},
+    {'bond': '申菱转债', 'stock': '301018', 'stock_name': '申菱环境', 'tongguo_date': '2026-02-04', 'zhuce_date': '2026-04-01', 'price_10d': 28.65, 'price_5d': 28.65, 'price_0d': 28.95},
+    {'bond': '奥普转债', 'stock': '688686', 'stock_name': '奥普特', 'tongguo_date': '2026-01-30', 'zhuce_date': '2026-03-18', 'price_10d': 9.11, 'price_5d': 9.11, 'price_0d': 9.02},
+    {'bond': '震裕转债', 'stock': '300953', 'stock_name': '震裕科技', 'tongguo_date': '2025-11-14', 'zhuce_date': '2025-12-31', 'price_10d': None, 'price_5d': None, 'price_0d': 233.44},
+    {'bond': '华纬转债', 'stock': '001380', 'stock_name': '华纬科技', 'tongguo_date': '2025-11-20', 'zhuce_date': '2025-12-31', 'price_10d': None, 'price_5d': None, 'price_0d': 277.73},
 ]
 
 
@@ -125,7 +125,8 @@ def backtest_latent_strategy():
     results = []
     
     for item in HISTORICAL_DATA:
-        bond = item['bond']
+        bond = item.get('bond', '')
+        stock_name = item.get('stock_name', '')
         stock = item['stock']
         tongguo_date = item['tongguo_date']
         zhuce_date = item['zhuce_date']
@@ -137,12 +138,15 @@ def backtest_latent_strategy():
         zhuce_dt = datetime.strptime(zhuce_date, '%Y-%m-%d')
         days_between = (zhuce_dt - tongguo_dt).days
         
+        # 显示名称：优先用 bond_name，否则用 stock_name
+        display_name = bond if bond and bond != 'N/A' else stock_name
+        
         # 只回测间隔 25-55 天的案例
         if days_between < 25 or days_between > 55:
-            print(f'⚠️ 跳过 {bond}: 间隔{days_between}天 (不在 25-55 天窗口)')
+            print(f'⚠️ 跳过 {display_name}: 间隔{days_between}天 (不在 25-55 天窗口)')
             continue
         
-        print(f'\n{bond} ({stock})')
+        print(f'\n{display_name} ({stock})')
         print(f'  上市委通过：{tongguo_date}')
         print(f'  同意注册：{zhuce_date}')
         print(f'  间隔：{days_between}天')
@@ -163,41 +167,72 @@ def backtest_latent_strategy():
         # 分析信号
         if signals_found:
             first_signal = signals_found[0]
-            last_signal = signals_found[-1]
             
-            # 计算从第一个信号到注册日的收益
-            signal_date = first_signal['check_date']
+            # 获取股票历史价格（用于计算每个信号的实际收益）
+            prices = sina.fetch_history(stock, days=90)
+            sorted_dates = sorted(prices.keys()) if prices else []
+            
+            # 找到注册日价格
+            zhuce_idx = None
+            for i, d in enumerate(sorted_dates):
+                if d >= zhuce_date:
+                    zhuce_idx = i
+                    break
+            price_at_zhuce = prices[sorted_dates[zhuce_idx]]['close'] if zhuce_idx is not None else None
+            
+            # 计算每个信号的收益
+            signal_gains = []
+            for sig in signals_found:
+                sig_date = sig['check_date']
+                sig_idx = None
+                for i, d in enumerate(sorted_dates):
+                    if d >= sig_date:
+                        sig_idx = i
+                        break
+                if sig_idx is not None:
+                    price_at_signal = prices[sorted_dates[sig_idx]]['close']
+                    if price_at_zhuce and price_at_signal > 0:
+                        gain = (price_at_zhuce - price_at_signal) / price_at_signal * 100
+                        signal_gains.append({
+                            'date': sig_date,
+                            'days_before': sig['days_before_zhuce'],
+                            'price': price_at_signal,
+                            'gain': gain,
+                            'change_2d': sig['price_change_2d'],
+                            'change_5d': sig['price_change_5d'],
+                        })
+            
+            # 用第一个信号的收益作为该转债的收益
+            first_gain = signal_gains[0]['gain'] if signal_gains else None
             days_before = first_signal['days_before_zhuce']
             
-            # 获取注册前 5 天和注册日价格
-            price_at_signal = item.get('price_5d') if days_before >= 5 else item['price_0d']
-            price_at_zhuce = item['price_0d']
-            
-            if price_at_signal and price_at_zhuce:
-                potential_gain = (price_at_zhuce - price_at_signal) / price_at_signal * 100
-            else:
-                potential_gain = None
-            
             print(f'  🚨 发现 {len(signals_found)} 个信号')
-            print(f'     第一个信号：上市后第{signals_found[0]["days_before_zhuce"]+days_between-25}天 (注册前{days_before}天)')
+            print(f'     第一个信号：注册前{days_before}天 ({first_signal["check_date"]})')
             print(f'     信号强度：2 日{first_signal["price_change_2d"]:+.1f}%, 5 日{first_signal["price_change_5d"]:+.1f}%, 突破={first_signal["breakthrough"]}')
             
-            if potential_gain is not None:
-                print(f'     潜在收益：{potential_gain:+.1f}%')
+            if signal_gains:
+                print(f'     各信号入场收益:')
+                for sg in signal_gains:
+                    icon = '✅' if sg['gain'] > 0 else '❌'
+                    print(f'       {sg["date"]} (注册前{sg["days_before"]}天): {sg["gain"]:+.1f}% {icon}')
+            
+            if first_gain is not None:
+                print(f'     首个信号收益：{first_gain:+.1f}%')
             
             results.append({
-                'bond': bond,
+                'bond': display_name,
                 'stock': stock,
                 'days_between': days_between,
                 'signal_found': True,
                 'signal_days_before': days_before,
-                'potential_gain': potential_gain,
+                'potential_gain': first_gain,
                 'signal_count': len(signals_found),
+                'signal_gains': signal_gains,
             })
         else:
             print(f'  ❌ 未发现信号')
             results.append({
-                'bond': bond,
+                'bond': display_name,
                 'stock': stock,
                 'days_between': days_between,
                 'signal_found': False,
