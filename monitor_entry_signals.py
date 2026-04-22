@@ -7,6 +7,8 @@
 1. 同意注册当日入场 → 持有 10 天
 2. 上市委通过后 10 天入场 → 持有 20 天
 
+🆕 新增股票质量评估功能，自动筛选优质正股
+
 当发现入场窗口时提醒用户
 """
 
@@ -17,6 +19,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.data_source import JisiluAPI, SinaFinanceAPI
+from lib.stock_quality import StockQualityEvaluator, print_quality_report
 import re
 
 
@@ -71,14 +74,22 @@ def save_history(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def check_entry_signals():
-    """检查入场信号"""
+def check_entry_signals(show_quality: bool = True, min_rating: str = 'B'):
+    """
+    检查入场信号
+    
+    Args:
+        show_quality: 是否显示股票质量评估
+        min_rating: 最低股票质量评级要求 ('A'/'B'/'C')
+    """
     jsl = JisiluAPI(timeout=30)
     sina = SinaFinanceAPI(timeout=30)
+    evaluator = StockQualityEvaluator(sina_api=sina)
     
     print('=' * 80)
     print(f'可转债入场时机监控')
     print(f'检查时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    print(f'股票质量筛选：≥{min_rating}级')
     print('=' * 80)
     print()
     
@@ -114,12 +125,22 @@ def check_entry_signals():
                 # 检查是否已经提醒过
                 alert_key = f'{bond_code}_zhuce'
                 if alert_key not in history.get('bonds', {}):
-                    # 获取当前股价
-                    prices = sina.fetch_history(stock_code, days=10)
+                    # 获取当前股价（需要 90 天数据用于质量评估）
+                    prices = sina.fetch_history(stock_code, days=90)
                     current_price = 0
                     if prices:
                         latest_date = max(prices.keys())
                         current_price = prices[latest_date].get('close', 0)
+                    
+                    # 股票质量评估
+                    stock_quality = None
+                    if show_quality and stock_code:
+                        stock_quality = evaluator.evaluate(stock_code)
+                        # 如果股票质量不达标，跳过
+                        rating_order = {'A': 4, 'B': 3, 'C': 2, 'D': 1}
+                        if rating_order.get(stock_quality['rating'], 0) < rating_order.get(min_rating, 3):
+                            print(f'⚠️ 跳过 {bond_name}: 股票质量 {stock_quality["rating"]}级 (要求≥{min_rating}级)')
+                            continue
                     
                     alert = {
                         'type': '同意注册当日入场',
@@ -134,6 +155,7 @@ def check_entry_signals():
                         'win_rate': '60.0%',
                         'hold_days': 10,
                         'exit_date': calculate_exit_date(zhuce_date, 10),
+                        'stock_quality': stock_quality,
                     }
                     alerts.append(alert)
                     history['bonds'][alert_key] = today
@@ -154,12 +176,22 @@ def check_entry_signals():
                 # 检查是否已经提醒过
                 alert_key = f'{bond_code}_tongguo'
                 if alert_key not in history.get('bonds', {}):
-                    # 获取当前股价
-                    prices = sina.fetch_history(stock_code, days=10)
+                    # 获取当前股价（需要 90 天数据用于质量评估）
+                    prices = sina.fetch_history(stock_code, days=90)
                     current_price = 0
                     if prices:
                         latest_date = max(prices.keys())
                         current_price = prices[latest_date].get('close', 0)
+                    
+                    # 股票质量评估
+                    stock_quality = None
+                    if show_quality and stock_code:
+                        stock_quality = evaluator.evaluate(stock_code)
+                        # 如果股票质量不达标，跳过
+                        rating_order = {'A': 4, 'B': 3, 'C': 2, 'D': 1}
+                        if rating_order.get(stock_quality['rating'], 0) < rating_order.get(min_rating, 3):
+                            print(f'⚠️ 跳过 {bond_name}: 股票质量 {stock_quality["rating"]}级 (要求≥{min_rating}级)')
+                            continue
                     
                     alert = {
                         'type': '上市委通过后 10 天入场',
@@ -175,6 +207,7 @@ def check_entry_signals():
                         'win_rate': '62.5%',
                         'hold_days': 20,
                         'exit_date': calculate_exit_date(entry_date, 20),
+                        'stock_quality': stock_quality,
                     }
                     alerts.append(alert)
                     history['bonds'][alert_key] = today
@@ -225,6 +258,13 @@ def check_entry_signals():
                 print(f'  预期收益：{alert["expected_return"]} (胜率{alert["win_rate"]})')
                 print(f'  持有时间：{alert["hold_days"]}天')
                 print(f'  预计卖出：{alert["exit_date"]}')
+                
+                # 显示股票质量评估
+                if alert.get('stock_quality'):
+                    quality = alert['stock_quality']
+                    print(f'  📊 股票质量：{quality["total_score"]:.1f}分 ({quality["rating"]}级)')
+                    print(f'     趋势:{quality["trend_score"]:.1f}/40 | 动量:{quality["momentum_score"]:.1f}/30 | 成交量:{quality["volume_score"]:.1f}/20')
+                    print(f'     推荐：{quality["recommendation"]}')
             
             elif alert['type'] == '上市委通过后 10 天入场':
                 print(f'  上市委通过：{alert["trigger_date"]}')
@@ -234,6 +274,13 @@ def check_entry_signals():
                 print(f'  预期收益：{alert["expected_return"]} (胜率{alert["win_rate"]})')
                 print(f'  持有时间：{alert["hold_days"]}天')
                 print(f'  预计卖出：{alert["exit_date"]}')
+                
+                # 显示股票质量评估
+                if alert.get('stock_quality'):
+                    quality = alert['stock_quality']
+                    print(f'  📊 股票质量：{quality["total_score"]:.1f}分 ({quality["rating"]}级)')
+                    print(f'     趋势:{quality["trend_score"]:.1f}/40 | 动量:{quality["momentum_score"]:.1f}/30 | 成交量:{quality["volume_score"]:.1f}/20')
+                    print(f'     推荐：{quality["recommendation"]}')
             
             elif alert['type'] == '即将进入监控期':
                 print(f'  上市委通过：{alert["tongguo_date"]}')
@@ -316,11 +363,16 @@ def main():
     parser = argparse.ArgumentParser(description='可转债入场时机监控')
     parser.add_argument('--once', action='store_true', help='只运行一次')
     parser.add_argument('--interval', type=int, default=60, help='监控间隔（分钟），默认 60')
+    parser.add_argument('--no-quality', action='store_true', help='禁用股票质量评估')
+    parser.add_argument('--min-rating', type=str, default='B', choices=['A', 'B', 'C'], 
+                        help='最低股票质量评级 (默认：B)')
     args = parser.parse_args()
+    
+    show_quality = not args.no_quality
     
     if args.once:
         # 只运行一次
-        check_entry_signals()
+        check_entry_signals(show_quality=show_quality, min_rating=args.min_rating)
     else:
         # 持续监控
         import time
@@ -330,7 +382,7 @@ def main():
         
         try:
             while True:
-                check_entry_signals()
+                check_entry_signals(show_quality=show_quality, min_rating=args.min_rating)
                 print(f'下次检查：{args.interval}分钟后')
                 print()
                 time.sleep(args.interval * 60)
