@@ -73,9 +73,6 @@ python scripts/analyze_quequan_profit.py --limit 5
 
 # 分析指定年份
 python scripts/analyze_quequan_profit.py --year 2025
-
-# 离线测试（使用内置数据）
-python scripts/analyze_quequan_profit.py --offline
 ```
 
 ---
@@ -87,7 +84,6 @@ python scripts/analyze_quequan_profit.py --offline
 ```bash
 python scripts/analyze_compact.py              # 2026 年全部
 python scripts/analyze_compact.py --limit 5    # 最近 5 只
-python scripts/analyze_compact.py --offline    # 离线测试
 ```
 
 ---

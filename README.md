@@ -71,9 +71,6 @@ python scripts/analyze_compact.py
 
 # 分析前 5 只
 python scripts/analyze_compact.py --limit 5
-
-# 离线测试
-python scripts/analyze_compact.py --offline
 ```
 
 ### 3. 完整详细报告
@@ -222,7 +219,6 @@ md = gen.generate_markdown_report(analyses)
 |------|------|--------|
 | `--limit`, `-n` | 分析数量 (0=全部) | 0 |
 | `--year` | 分析指定年份 | 2026 |
-| `--offline` | 离线测试模式 | False |
 
 ### analyze_quequan_profit.py
 
@@ -230,7 +226,6 @@ md = gen.generate_markdown_report(analyses)
 |------|------|--------|
 | `--limit`, `-n` | 分析数量 (0=全部) | 0 |
 | `--year` | 分析指定年份 | 2026 |
-| `--offline` | 离线测试模式 | False |
 | `--format`, `-f` | 输出格式 (text/json/markdown) | text |
 | `--output`, `-o` | 输出文件路径 | stdout |
 
@@ -256,8 +251,7 @@ md = gen.generate_markdown_report(analyses)
 1. **API 限流**: 在线模式会调用东方财富和新浪财经 API，建议批量获取
 2. **交易日计算**: T-3/T-2/T-1/T+1 自动跳过周末和节假日
 3. **数据 fallback**: 上市价格获取失败时，使用 FIRST_PROFIT 反推
-4. **离线测试**: 开发调试建议使用 `--offline` 模式
-5. **潜伏策略**: 前 10 个案例进化效果不明显，需要耐心积累数据
+4. **潜伏策略**: 前 10 个案例进化效果不明显，需要耐心积累数据
 
 ## 数据来源
 

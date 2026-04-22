@@ -21,9 +21,6 @@ Usage:
     # 指定年份
     python analyze_quequan_profit.py --year 2025
     
-    # 离线测试 (使用内置数据)
-    python analyze_quequan_profit.py --offline
-    
     # 输出 JSON 格式
     python analyze_quequan_profit.py --format json
     
@@ -43,135 +40,7 @@ from lib.bond_calculator import BondCalculator, QuequanAnalysis
 from lib.report import ReportGenerator
 
 
-# ==================== 离线测试数据 ====================
-
-OFFLINE_TEST_DATA = [
-    {
-        'bond_name': '上 26 转债',
-        'bond_code': '118050',
-        'stock_code': '688533',
-        'stock_name': '上声电子',
-        'listing_date': '2026-04-14',
-        'record_date': '2026-03-17',
-        'credit_rating': 'A+',
-        'per_share_amount': 1.9680,
-        'first_profit': 523.01,
-        'listing_close': 147.546,
-    },
-    {
-        'bond_name': '博士转债',
-        'bond_code': '123240',
-        'stock_code': '300622',
-        'stock_name': '博士眼镜',
-        'listing_date': '2026-04-07',
-        'record_date': '2026-03-17',
-        'credit_rating': 'AA',
-        'per_share_amount': 1.6457,
-        'first_profit': 422.70,
-        'listing_close': 138.427,
-    },
-    {
-        'bond_name': '长高转债',
-        'bond_code': '127103',
-        'stock_code': '002452',
-        'stock_name': '长高电新',
-        'listing_date': '2026-03-30',
-        'record_date': '2026-03-06',
-        'credit_rating': 'AA-',
-        'per_share_amount': 1.2228,
-        'first_profit': 433.89,
-        'listing_close': 139.445,
-    },
-    {
-        'bond_name': '祥和转债',
-        'bond_code': '111026',
-        'stock_code': '603500',
-        'stock_name': '祥和实业',
-        'listing_date': '2026-03-26',
-        'record_date': '2026-03-02',
-        'credit_rating': 'A+',
-        'per_share_amount': 1.2010,
-        'first_profit': 547.44,
-        'listing_close': 154.744,
-    },
-    {
-        'bond_name': '统联转债',
-        'bond_code': '118049',
-        'stock_code': '688210',
-        'stock_name': '统联精密',
-        'listing_date': '2026-03-20',
-        'record_date': '2026-02-27',
-        'credit_rating': 'AA-',
-        'per_share_amount': 3.6120,
-        'first_profit': 337.54,
-        'listing_close': 133.754,
-    },
-]
-
-OFFLINE_STOCK_PRICES = {
-    '688533': {
-        '2026-03-12': {'close': 32.48},
-        '2026-03-13': {'close': 32.36},
-        '2026-03-16': {'close': 31.29},
-        '2026-03-17': {'close': 29.66},
-        '2026-03-18': {'close': 27.89},
-    },
-    '300622': {
-        '2026-03-12': {'close': 30.10},
-        '2026-03-13': {'close': 29.50},
-        '2026-03-16': {'close': 28.80},
-        '2026-03-17': {'close': 28.56},
-        '2026-03-18': {'close': 24.16},
-    },
-    '002452': {
-        '2026-03-03': {'close': 10.80},
-        '2026-03-04': {'close': 10.98},
-        '2026-03-05': {'close': 11.10},
-        '2026-03-06': {'close': 11.28},
-        '2026-03-07': {'close': 10.21},
-    },
-    '603500': {
-        '2026-02-25': {'close': 15.20},
-        '2026-02-26': {'close': 15.00},
-        '2026-02-27': {'close': 14.80},
-        '2026-02-28': {'close': 14.50},
-        '2026-03-01': {'close': 14.78},
-        '2026-03-02': {'close': 14.50},
-    },
-    '688210': {
-        '2026-02-24': {'close': 55.89},
-        '2026-02-25': {'close': 56.94},
-        '2026-02-26': {'close': 58.00},
-        '2026-02-27': {'close': 61.32},
-        '2026-02-28': {'close': 39.87},
-    },
-}
-
-
-def run_offline(limit: int = 5) -> list:
-    """
-    离线模式：使用内置测试数据
-    
-    Args:
-        limit: 分析数量
-        
-    Returns:
-        分析结果列表
-    """
-    print("模式：离线测试 (使用内置数据)")
-    print()
-    
-    calc = BondCalculator(target_bonds=10, bond_price=100.0)
-    analyses = []
-    
-    for bond_info in OFFLINE_TEST_DATA[:limit]:
-        analysis = calc.analyze_quequan_profit(bond_info, OFFLINE_STOCK_PRICES)
-        analyses.append(analysis)
-    
-    return analyses
-
-
-def run_online(limit: int = 0, year: int = 0, month: int = 0, from_month: int = 0) -> list:
+def run_analysis(limit: int = 0, year: int = 0, month: int = 0, from_month: int = 0) -> list:
     """
     在线模式：从 API 获取实时数据
     
@@ -316,7 +185,6 @@ def main():
   %(prog)s --year 2025        # 分析 2025 年上市转债
   %(prog)s --year 2025 --month 12  # 分析 2025 年 12 月上市转债
   %(prog)s --compact          # 紧凑摘要模式 (适合聊天界面)
-  %(prog)s --offline          # 离线测试模式
   %(prog)s --format json      # 输出 JSON 格式
   %(prog)s --format markdown  # 输出 Markdown格式
   %(prog)s --output report.txt # 保存到文件
@@ -358,12 +226,6 @@ def main():
     )
     
     parser.add_argument(
-        '--offline',
-        action='store_true',
-        help='使用离线测试数据 (不调用 API)'
-    )
-    
-    parser.add_argument(
         '--format', '-f',
         choices=['text', 'json', 'markdown'],
         default='text',
@@ -388,16 +250,11 @@ def main():
             cmd.extend(['--year', str(args.year)])
         if args.month > 0:
             cmd.extend(['--month', str(args.month)])
-        if args.offline:
-            cmd.append('--offline')
         subprocess.run(cmd)
         return
     
     # 运行分析
-    if args.offline:
-        analyses = run_offline(limit=args.limit if args.limit > 0 else 5)
-    else:
-        analyses = list(run_online(limit=args.limit, year=args.year, month=args.month, from_month=args.from_month))
+    analyses = list(run_analysis(limit=args.limit, year=args.year, month=args.month, from_month=args.from_month))
     
     if not analyses:
         print("没有分析结果")
