@@ -161,38 +161,28 @@ class SQLiteDatabase:
         }
         
         with self._get_conn() as conn:
-            # 获取最新的快照
+            # 获取所有债券的最新记录（不管快照）
+            cursor = conn.execute('''
+                SELECT pb1.bond_code, pb1.progress, pb1.progress_full
+                FROM pending_bonds pb1
+                INNER JOIN (
+                    SELECT bond_code, MAX(id) as max_id
+                    FROM pending_bonds
+                    GROUP BY bond_code
+                ) pb2 ON pb1.bond_code = pb2.bond_code AND pb1.id = pb2.max_id
+            ''')
+            
+            old_data = {row['bond_code']: {
+                'progress': row['progress'],
+                'progress_full': row['progress_full'],
+            } for row in cursor.fetchall()}
+            
+            # 获取今日快照
             cursor = conn.execute(
                 'SELECT id FROM snapshots WHERE snapshot_date = ? ORDER BY id DESC LIMIT 1',
                 (today,)
             )
             latest_snapshot = cursor.fetchone()
-            
-            if latest_snapshot:
-                # 已有今日快照，获取上次的数据
-                latest_id = latest_snapshot['id']
-                cursor = conn.execute(
-                    'SELECT bond_code, progress, progress_full FROM pending_bonds WHERE id = ?',
-                    (latest_id,)
-                )
-                # 获取所有最新记录
-                cursor = conn.execute('''
-                    SELECT pb1.bond_code, pb1.progress, pb1.progress_full
-                    FROM pending_bonds pb1
-                    INNER JOIN (
-                        SELECT bond_code, MAX(id) as max_id
-                        FROM pending_bonds
-                        WHERE id <= ?
-                        GROUP BY bond_code
-                    ) pb2 ON pb1.bond_code = pb2.bond_code AND pb1.id = pb2.max_id
-                ''', (latest_id,))
-                
-                old_data = {row['bond_code']: {
-                    'progress': row['progress'],
-                    'progress_full': row['progress_full'],
-                } for row in cursor.fetchall()}
-            else:
-                old_data = {}
             
             # 检查变化
             changed_bonds = []
