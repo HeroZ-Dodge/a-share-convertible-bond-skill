@@ -22,24 +22,24 @@
 
 ```bash
 # 运行一次（自动保存数据 + 自动进化）
-python scripts/monitor/monitor_latent_strategy.py --once
+python3 scripts/monitor/monitor_latent_strategy.py --once
 
 # 持续监控（每 60 分钟）
-python scripts/monitor/monitor_latent_strategy.py
+python3 scripts/monitor/monitor_latent_strategy.py
 ```
 
 ### 查看进化报告
 
 ```bash
 # 显示进化报告
-python scripts/monitor/monitor_latent_strategy.py --report
+python3 scripts/monitor/monitor_latent_strategy.py --report
 ```
 
 ### 导出数据
 
 ```bash
 # 导出所有数据到 JSON 文件
-python scripts/monitor/monitor_latent_strategy.py --export
+python3 scripts/monitor/monitor_latent_strategy.py --export
 ```
 
 ---
@@ -140,7 +140,7 @@ data/
 
 ```bash
 # 运行回测
-python scripts/monitor/backtest_latent_strategy.py
+python3 scripts/monitor/backtest_latent_strategy.py
 ```
 
 **回测结果** (基于 8 只历史转债):

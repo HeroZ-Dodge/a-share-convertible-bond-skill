@@ -12,19 +12,19 @@
 
 Usage:
     # 查看待发转债列表
-    python analyze_pending.py
+    python3 analyze_pending.py
     
     # 紧凑摘要模式 (适合聊天)
-    python analyze_pending.py --compact
+    python3 analyze_pending.py --compact
     
     # 分析前 N 只
-    python analyze_pending.py --limit 5
+    python3 analyze_pending.py --limit 5
     
     # 输出 JSON 格式
-    python analyze_pending.py --format json
+    python3 analyze_pending.py --format json
     
     # 保存到文件
-    python analyze_pending.py --output pending.txt
+    python3 analyze_pending.py --output pending.txt
 """
 
 import argparse

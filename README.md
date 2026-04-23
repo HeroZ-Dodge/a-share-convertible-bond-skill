@@ -58,13 +58,13 @@ a-share-convertible-bond-skill/
 
 ```bash
 # 运行一次
-python scripts/monitor/monitor_latent_strategy.py --once
+python3 scripts/monitor/monitor_latent_strategy.py --once
 
 # 持续监控（每 60 分钟）
-python scripts/monitor/monitor_latent_strategy.py
+python3 scripts/monitor/monitor_latent_strategy.py
 
 # 查看进化报告
-python scripts/monitor/monitor_latent_strategy.py --report
+python3 scripts/monitor/monitor_latent_strategy.py --report
 ```
 
 触发信号的条件：
@@ -81,29 +81,29 @@ python scripts/monitor/monitor_latent_strategy.py --report
 
 ```bash
 # 查看待发转债
-python scripts/analyze_pending.py
+python3 scripts/analyze_pending.py
 
 # 紧凑摘要
-python scripts/analyze_pending.py --compact
+python3 scripts/analyze_pending.py --compact
 
 # 查看前 5 只
-python scripts/analyze_pending.py --limit 5
+python3 scripts/analyze_pending.py --limit 5
 ```
 
 ### 3. 历史节点分析（辅助研究）
 
 ```bash
 # 同意注册后股价变化
-python scripts/analyze_registration_entry.py
+python3 scripts/analyze_registration_entry.py
 
 # 同意注册对股价的影响
-python scripts/analyze_registration_impact.py
+python3 scripts/analyze_registration_impact.py
 
 # 同意注册到发行公告期间的股价变化
-python scripts/analyze_registration_to_announcement.py
+python3 scripts/analyze_registration_to_announcement.py
 
 # 同意注册前的早期异动信号
-python scripts/analyze_early_signals.py
+python3 scripts/analyze_early_signals.py
 ```
 
 ## 模块说明
