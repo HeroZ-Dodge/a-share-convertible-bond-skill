@@ -17,25 +17,25 @@ from typing import Dict, List, Optional, Any
 class SignalTracker:
     """信号跟踪器"""
     
-    def __init__(self, db=None, sina_api=None):
+    def __init__(self, db=None, kline_cache=None):
         """
         初始化跟踪器
-        
+
         Args:
             db: LocalDatabase 实例
-            sina_api: SinaFinanceAPI 实例
+            kline_cache: BacktestCache 实例，用于获取K线数据
         """
         if db is None:
             from lib.local_database import LocalDatabase
             self.db = LocalDatabase()
         else:
             self.db = db
-        
-        if sina_api is None:
-            from lib.data_source import SinaFinanceAPI
-            self.sina_api = SinaFinanceAPI(timeout=15)
+
+        if kline_cache is None:
+            from lib.backtest_cache import BacktestCache
+            self.kline_cache = BacktestCache()
         else:
-            self.sina_api = sina_api
+            self.kline_cache = kline_cache
     
     def get_active_signals(self) -> List[Dict]:
         """
@@ -77,7 +77,7 @@ class SignalTracker:
         signal_date = signal.get('date', '')
         
         # 获取当前股价
-        prices = self.sina_api.fetch_history(stock_code, days=10)
+        prices = self.kline_cache.get_kline_as_dict(stock_code, days=10)
         if not prices:
             return {
                 'bond_code': bond_code,

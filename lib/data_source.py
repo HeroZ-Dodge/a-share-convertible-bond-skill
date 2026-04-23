@@ -6,23 +6,21 @@
 
 支持的数据源:
 - 集思录 (待发转债、申购信息) - **公告前即可获取**
-- 东方财富网 (转债发行信息、上市价格)
-- 新浪财经 (股票历史 K 线)
+- 东方财富网 (转债发行信息、上市价格、股票K线、主力流向、实时行情、涨停)
 
 Usage:
-    from lib.data_source import JisiluAPI, EastmoneyAPI, SinaFinanceAPI
-    
+    from lib.data_source import JisiluAPI, EastmoneyAPI
+
     # 获取待发转债列表 (公告前)
     jsl = JisiluAPI()
     bonds = jsl.fetch_pending_bonds(limit=10)
-    
+
     # 获取已上市转债列表
     em = EastmoneyAPI()
     bonds = em.fetch_listed_bonds(limit=10)
-    
-    # 获取股票历史价格
-    sina = SinaFinanceAPI()
-    prices = sina.fetch_history('300622', days=90)
+
+    # 获取股票K线
+    klines = em.fetch_stock_kline('300622', days=90)
 """
 
 import json
@@ -68,14 +66,476 @@ class EastmoneyAPI:
     
     def _request(self, url: str, headers: dict = HEADERS) -> Optional[dict]:
         """发送 HTTP 请求"""
+        import gzip
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                return json.loads(response.read().decode('utf-8'))
+                raw_data = response.read()
+                if response.headers.get('Content-Encoding') == 'gzip' or raw_data[:2] == b'\x1f\x8b':
+                    raw_data = gzip.decompress(raw_data)
+                return json.loads(raw_data.decode('utf-8'))
         except Exception as e:
             print(f"API 请求失败：{url[:100]}... - {e}")
             return None
     
+    def _get_market_prefix(self, stock_code: str) -> str:
+        """获取市场前缀 (0=深市, 1=沪市)"""
+        if stock_code.startswith('6') or stock_code.startswith('900'):
+            return '1'
+        return '0'
+
+    # ==================== K 线数据 ====================
+
+    def fetch_stock_kline(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
+        """
+        获取股票日 K 线数据（东方财富 push2 接口）
+
+        Args:
+            stock_code: 6位股票代码
+            days: 获取天数
+
+        Returns:
+            [{date, open, close, high, low, volume, amount, amplitude,
+              change_pct, change_amount, turnover_rate}, ...]
+        """
+        market = self._get_market_prefix(stock_code)
+        url = (
+            f"https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+            f"secid={market}.{stock_code}&"
+            f"fields1=f1,f2,f3,f4,f5,f6&"
+            f"fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&"
+            f"klt=101&fqt=1&"
+            f"lmt={days}"
+        )
+
+        data = self._request(url)
+        if not data or not data.get('data') or not data['data'].get('klines'):
+            return []
+
+        result = []
+        for line in data['data']['klines']:
+            parts = line.split(',')
+            if len(parts) < 12:
+                continue
+            result.append({
+                'date': parts[0],
+                'open': float(parts[1]),
+                'close': float(parts[2]),
+                'high': float(parts[3]),
+                'low': float(parts[4]),
+                'volume': float(parts[5]),
+                'amount': float(parts[6]),
+                'amplitude': float(parts[7]),
+                'change_pct': float(parts[8]),
+                'change_amount': float(parts[9]),
+                'turnover_rate': float(parts[10]),
+            })
+        return result
+
+    # ==================== 主力资金流向 ====================
+
+    def fetch_fund_flow(self, stock_code: str, days: int = 120) -> List[Dict[str, Any]]:
+        """
+        获取主力资金流向日 K 数据
+
+        Args:
+            stock_code: 6位股票代码
+            days: 获取天数
+
+        Returns:
+            [{date, main_net_inflow, main_net_inflow_rate,
+             超大单_net_inflow, large_net_inflow, medium_net_inflow, small_net_inflow}, ...]
+        """
+        market = self._get_market_prefix(stock_code)
+        url = (
+            f"https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?"
+            f"secid={market}.{stock_code}&"
+            f"fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11&"
+            f"fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60&"
+            f"klt=101&lmt={days}"
+        )
+
+        data = self._request(url)
+        if not data or not data.get('data') or not data['data'].get('klines'):
+            return []
+
+        result = []
+        for line in data['data']['klines']:
+            parts = line.split(',')
+            if len(parts) < 10:
+                continue
+            result.append({
+                'date': parts[0],
+                'main_net_inflow': float(parts[1]),
+                'main_net_inflow_rate': float(parts[2]),
+                '超大单_net_inflow': float(parts[3]),
+                'large_net_inflow': float(parts[4]),
+                'medium_net_inflow': float(parts[5]),
+                'small_net_inflow': float(parts[6]),
+            })
+        return result
+
+    # ==================== 实时行情快照 ====================
+
+    def fetch_realtime_quote(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """
+        获取股票实时行情快照（含 PE/PB/ROE/融资融券）
+
+        Args:
+            stock_code: 6位股票代码
+
+        Returns:
+            {price, change_pct, change_amount, open, high, low,
+             volume, amount, volume_ratio, pe_ttm, pb, pe_static,
+             total_market_cap, float_market_cap, eps, net_asset_per_share,
+             roe, gross_margin, debt_ratio, margin_balance, short_balance,
+             total_margin}
+        """
+        market = self._get_market_prefix(stock_code)
+        url = (
+            f"https://push2.eastmoney.com/api/qt/stock/get?"
+            f"secid={market}.{stock_code}&"
+            f"fields=f2,f3,f4,f5,f6,f7,f8,f9,f51,f60,f61,f62,f63,f64,"
+            f"f67,f68,f73,f74,f75,f148,f149,f150"
+        )
+
+        data = self._request(url)
+        if not data or not data.get('data'):
+            return None
+
+        d = data['data']
+        return {
+            'price': d.get('f2', 0),
+            'change_pct': d.get('f3', 0),
+            'change_amount': d.get('f4', 0),
+            'open': d.get('f5', 0),
+            'high': d.get('f6', 0),
+            'low': d.get('f7', 0),
+            'volume': d.get('f8', 0),
+            'amount': d.get('f9', 0),
+            'volume_ratio': d.get('f51', 0),
+            'pe_static': d.get('f60', 0),
+            'pe_ttm': d.get('f61', 0),
+            'pb': d.get('f62', 0),
+            'total_market_cap': d.get('f63', 0),
+            'float_market_cap': d.get('f64', 0),
+            'eps': d.get('f67', 0),
+            'net_asset_per_share': d.get('f68', 0),
+            'roe': d.get('f73', 0),
+            'gross_margin': d.get('f74', 0),
+            'debt_ratio': d.get('f75', 0),
+            'margin_balance': d.get('f148', 0),
+            'short_balance': d.get('f149', 0),
+            'total_margin': d.get('f150', 0),
+        }
+
+    # ==================== 涨停股池 ====================
+
+    def fetch_limit_up_pool(self, trade_date: str = None) -> List[Dict[str, Any]]:
+        """
+        获取涨停股池
+
+        Args:
+            trade_date: 交易日期 YYYY-MM-DD，None=最新交易日
+
+        Returns:
+            [{stock_code, stock_name, limit_up_price, change_pct,
+              volume, amount, consecutive_limit_up, seal_amount, seal_ratio}, ...]
+        """
+        import gzip
+
+        url = (
+            "https://push2ex.eastmoney.com/getZDPoolZBCG?"
+            "ut=fa5fd1943c7b386f172d6893dbfba10b&"
+            "fltt=2&invt=2&"
+            "fields=f3,f4,f12,f14,f15,f16,f17,f18,f20,f21,"
+            f"f22,f23,f24,f25,f26,f37,f38,f39,f40,f41,f45,f46,f47,f48,f50,f51,f52,f53,f54,f55,f56,f57,f60,f61,f62,f63,f64,f65"
+        )
+        if trade_date:
+            url += f"&date2={trade_date.replace('-', '')}"
+
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                raw_data = response.read()
+                if response.headers.get('Content-Encoding') == 'gzip' or raw_data[:2] == b'\x1f\x8b':
+                    raw_data = gzip.decompress(raw_data)
+                data = json.loads(raw_data.decode('utf-8'))
+        except Exception as e:
+            print(f"获取涨停股池失败：{e}")
+            return []
+
+        if not data or not data.get('data'):
+            return []
+
+        result = []
+        for item in data['data'].get('pool', []):
+            result.append({
+                'stock_code': item.get('f12', ''),
+                'stock_name': item.get('f14', ''),
+                'change_pct': item.get('f3', 0),
+                'limit_up_price': item.get('f20', 0),
+                'open': item.get('f17', 0),
+                'high': item.get('f15', 0),
+                'low': item.get('f16', 0),
+                'volume': item.get('f5', 0),
+                'amount': item.get('f6', 0),
+                'consecutive_limit_up': item.get('f111', 0),
+                'seal_amount': item.get('f64', 0),
+                'seal_ratio': item.get('f116', 0),
+            })
+        return result
+
+    # ==================== 融资融券 ====================
+
+    def fetch_margin_trading(self, stock_code: str, start_date: str = None,
+                             end_date: str = None, days: int = 90) -> List[Dict[str, Any]]:
+        """
+        获取融资融券明细数据
+
+        Args:
+            stock_code: 6位股票代码
+            start_date: 起始日期 YYYY-MM-DD
+            end_date: 结束日期 YYYY-MM-DD
+            days: 获取天数（当 start_date 为 None 时生效）
+
+        Returns:
+            [{date, margin_balance, short_balance, total_margin,
+              margin_buy_amount, margin_net_inflow, change_pct}, ...]
+        """
+        from datetime import datetime as dt
+        if not start_date:
+            end = dt.now()
+            start = end - timedelta(days=days + 30)
+            start_date = start.strftime('%Y-%m-%d')
+        if not end_date:
+            end_date = dt.now().strftime('%Y-%m-%d')
+
+        url = (
+            "https://datacenter-web.eastmoney.com/api/data/v1/get?"
+            "reportName=RPTA_WEB_RZRQ_GGMX&"
+            "columns=DATE,SCODE,SECNAME,RZYE,RQYL,RZRQYE,RQYE,RZMRE,ZDF,RZRQYECZ&"
+            f"filter=(SCODE=\"{stock_code}\")(DATE>='{start_date}')(DATE<='{end_date}')&"
+            "sortColumns=DATE&sortTypes=-1&"
+            "pageNumber=1&pageSize=100&"
+            "source=WEB&client=WEB"
+        )
+
+        data = self._request(url)
+        if not data or not data.get('success'):
+            return []
+
+        result = []
+        for item in data.get('result', {}).get('data', []):
+            result.append({
+                'date': item.get('DATE', ''),
+                'stock_code': item.get('SCODE', ''),
+                'stock_name': item.get('SECNAME', ''),
+                'margin_balance': item.get('RZYE', 0),        # 融资余额(元)
+                'short_volume': item.get('RQYL', 0),          # 融券余量(股)
+                'total_margin': item.get('RZRQYE', 0),        # 融资融券余额(元)
+                'short_balance': item.get('RQYE', 0),         # 融券余额(元)
+                'margin_buy_amount': item.get('RZMRE', 0),    # 融资买入额(元)
+                'change_pct': item.get('ZDF', 0),             # 涨跌幅
+                'balance_change': item.get('RZRQYECZ', 0),    # 余额变化
+            })
+        return result
+
+    # ==================== 大宗交易 ====================
+
+    def fetch_block_trade(self, stock_code: str, start_date: str = None,
+                          end_date: str = None, days: int = 90) -> List[Dict[str, Any]]:
+        """
+        获取大宗交易数据
+
+        Args:
+            stock_code: 6位股票代码
+            start_date: 起始日期 YYYY-MM-DD
+            end_date: 结束日期 YYYY-MM-DD
+            days: 获取天数
+
+        Returns:
+            [{date, deal_price, close_price, premium_ratio,
+              deal_volume, deal_amount, buyer_name, seller_name}, ...]
+        """
+        from datetime import datetime as dt
+        if not start_date:
+            end = dt.now()
+            start = end - timedelta(days=days + 30)
+            start_date = start.strftime('%Y-%m-%d')
+        if not end_date:
+            end_date = dt.now().strftime('%Y-%m-%d')
+
+        url = (
+            "https://datacenter-web.eastmoney.com/api/data/v1/get?"
+            "reportName=RPT_DATA_BLOCKTRADE&"
+            "columns=TRADE_DATE,SECURITY_CODE,SECURITY_NAME_ABBR,DEAL_PRICE,CLOSE_PRICE,"
+            "PREMIUM_RATIO,DEAL_VOLUME,DEAL_AMT,BUYER_NAME,SELLER_NAME&"
+            f"filter=(SECURITY_CODE=\"{stock_code}\")(TRADE_DATE>='{start_date}')(TRADE_DATE<='{end_date}')&"
+            "sortColumns=TRADE_DATE&sortTypes=-1&"
+            "pageNumber=1&pageSize=100&"
+            "source=WEB&client=WEB"
+        )
+
+        data = self._request(url)
+        if not data or not data.get('success'):
+            return []
+
+        result = []
+        for item in data.get('result', {}).get('data', []):
+            result.append({
+                'date': item.get('TRADE_DATE', ''),
+                'stock_code': item.get('SECURITY_CODE', ''),
+                'stock_name': item.get('SECURITY_NAME_ABBR', ''),
+                'deal_price': item.get('DEAL_PRICE', 0),
+                'close_price': item.get('CLOSE_PRICE', 0),
+                'premium_ratio': item.get('PREMIUM_RATIO', 0),  # 溢价率(%)
+                'deal_volume': item.get('DEAL_VOLUME', 0),
+                'deal_amount': item.get('DEAL_AMT', 0),         # 成交额(元)
+                'buyer_name': item.get('BUYER_NAME', ''),
+                'seller_name': item.get('SELLER_NAME', ''),
+            })
+        return result
+
+    # ==================== 股东户数 ====================
+
+    def fetch_holder_count(self, stock_code: str, days: int = 180) -> List[Dict[str, Any]]:
+        """
+        获取股东户数变化
+
+        Args:
+            stock_code: 6位股票代码
+            days: 获取天数（实际返回最近N期报告）
+
+        Returns:
+            [{end_date, holder_num, prev_holder_num, holder_num_change,
+              holder_num_ratio, interval_change_pct}, ...]
+        """
+        url = (
+            "https://datacenter-web.eastmoney.com/api/data/v1/get?"
+            "reportName=RPT_HOLDERNUM_DET&"
+            "columns=END_DATE,SECURITY_CODE,SECURITY_SHORT_NAME,HOLDER_NUM,"
+            "PRE_HOLDER_NUM,HOLDER_NUM_CHANGE,HOLDER_NUM_RATIO,INTERVAL_CHRATE&"
+            f"filter=(SECURITY_CODE=\"{stock_code}\")&"
+            "sortColumns=END_DATE&sortTypes=-1&"
+            "pageNumber=1&pageSize=20&"
+            "source=WEB&client=WEB"
+        )
+
+        data = self._request(url)
+        if not data or not data.get('success'):
+            return []
+
+        result = []
+        for item in data.get('result', {}).get('data', []):
+            result.append({
+                'end_date': item.get('END_DATE', ''),
+                'stock_code': item.get('SECURITY_CODE', ''),
+                'stock_name': item.get('SECURITY_SHORT_NAME', ''),
+                'holder_num': item.get('HOLDER_NUM', 0),
+                'prev_holder_num': item.get('PRE_HOLDER_NUM', 0),
+                'holder_num_change': item.get('HOLDER_NUM_CHANGE', 0),
+                'holder_num_ratio': item.get('HOLDER_NUM_RATIO', 0),  # 变化率(%)
+                'interval_change_pct': item.get('INTERVAL_CHRATE', 0),  # 区间涨跌幅
+            })
+        return result
+
+    # ==================== 机构调研 ====================
+
+    def fetch_institutional_research(self, stock_code: str, days: int = 180) -> List[Dict[str, Any]]:
+        """
+        获取机构调研记录
+
+        Args:
+            stock_code: 6位股票代码
+            days: 获取天数
+
+        Returns:
+            [{date, receive_object, investors, num, survey_type}, ...]
+        """
+        from datetime import datetime as dt
+        if days <= 0:
+            days = 180
+        start = dt.now() - timedelta(days=days + 30)
+        start_date = start.strftime('%Y-%m-%d')
+        end_date = dt.now().strftime('%Y-%m-%d')
+
+        url = (
+            "https://datacenter-web.eastmoney.com/api/data/v1/get?"
+            "reportName=RPT_ORG_SURVEYNEW&"
+            "columns=NOTICE_DATE,SECURITY_CODE,SECURITY_NAME_ABBR,"
+            "RECEIVE_OBJECT,INVESTIGATORS,NUM,SUM,RECEIVE_WAY_EXPLAIN&"
+            f"filter=(SECURITY_CODE=\"{stock_code}\")(NOTICE_DATE>='{start_date}')"
+            f"(NOTICE_DATE<='{end_date}')&"
+            "sortColumns=NOTICE_DATE&sortTypes=-1&"
+            "pageNumber=1&pageSize=100&"
+            "source=WEB&client=WEB"
+        )
+
+        data = self._request(url)
+        if not data or not data.get('success'):
+            return []
+
+        result = []
+        for item in data.get('result', {}).get('data', []):
+            result.append({
+                'date': item.get('NOTICE_DATE', ''),
+                'stock_code': item.get('SECURITY_CODE', ''),
+                'stock_name': item.get('SECURITY_NAME_ABBR', ''),
+                'receive_object': item.get('RECEIVE_OBJECT', ''),
+                'investigators': item.get('INVESTIGATORS', ''),
+                'num': item.get('NUM', 0),             # 参与调研机构数
+                'total': item.get('SUM', 0),            # 参与人数
+                'survey_type': item.get('RECEIVE_WAY_EXPLAIN', ''),
+            })
+        return result
+
+    # ==================== 北向资金持股 ====================
+
+    def fetch_northbound_holding(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
+        """
+        获取北向资金持股数据
+
+        Args:
+            stock_code: 6位股票代码
+            days: 获取天数
+
+        Returns:
+            [{trade_date, shares, shares_ratio, share_change,
+              market_cap, free_shares_ratio}, ...]
+        """
+        url = (
+            "https://datacenter-web.eastmoney.com/api/data/v1/get?"
+            "reportName=RPT_MUTUAL_STOCK_NORTHSTA&"
+            "columns=TRADE_DATE,SECURITY_CODE,SECURITY_SHORT_NAME,"
+            "HOLD_SHARES,HOLD_SHARES_RATIO,SHARE_CHANGE,ADD_MARKET_CAP,"
+            "HOLD_MARKET_CAP,FREE_SHARES_RATIO&"
+            f"filter=(SECURITY_CODE=\"{stock_code}\")&"
+            "sortColumns=TRADE_DATE&sortTypes=-1&"
+            "pageNumber=1&pageSize=100&"
+            "source=WEB&client=WEB"
+        )
+
+        data = self._request(url)
+        if not data or not data.get('success'):
+            return []
+
+        result = []
+        for item in data.get('result', {}).get('data', []):
+            result.append({
+                'trade_date': item.get('TRADE_DATE', ''),
+                'stock_code': item.get('SECURITY_CODE', ''),
+                'stock_name': item.get('SECURITY_SHORT_NAME', ''),
+                'shares': item.get('HOLD_SHARES', 0),
+                'shares_ratio': item.get('HOLD_SHARES_RATIO', 0),  # 持股比例(%)
+                'share_change': item.get('SHARE_CHANGE', 0),       # 持股变动
+                'market_cap': item.get('HOLD_MARKET_CAP', 0),      # 持股市值(元)
+                'free_ratio': item.get('FREE_SHARES_RATIO', 0),    # 占流通股比例(%)
+            })
+        return result
+
+    # ==================== 已上市转债列表 ====================
+
     def fetch_listed_bonds(self, limit: int = 10) -> List[Dict[str, Any]]:
         """
         获取已上市转债列表

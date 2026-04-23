@@ -161,18 +161,18 @@ class SQLiteDatabase:
         }
         
         with self._get_conn() as conn:
-            # 获取所有债券的最新记录（不管快照）
+            # 获取所有债券的最新记录（使用 stock_code 作为唯一标识）
             cursor = conn.execute('''
-                SELECT pb1.bond_code, pb1.progress, pb1.progress_full
+                SELECT pb1.stock_code, pb1.progress, pb1.progress_full
                 FROM pending_bonds pb1
                 INNER JOIN (
-                    SELECT bond_code, MAX(id) as max_id
+                    SELECT stock_code, MAX(id) as max_id
                     FROM pending_bonds
-                    GROUP BY bond_code
-                ) pb2 ON pb1.bond_code = pb2.bond_code AND pb1.id = pb2.max_id
+                    GROUP BY stock_code
+                ) pb2 ON pb1.stock_code = pb2.stock_code AND pb1.id = pb2.max_id
             ''')
             
-            old_data = {row['bond_code']: {
+            old_data = {row['stock_code']: {
                 'progress': row['progress'],
                 'progress_full': row['progress_full'],
             } for row in cursor.fetchall()}
@@ -188,12 +188,15 @@ class SQLiteDatabase:
             changed_bonds = []
             
             for bond in bonds:
-                bond_code = bond.get('bond_code', '')
-                if not bond_code:
+                stock_code = bond.get('stock_code', '')
+                if not stock_code:
                     continue
                 
+                # 使用 stock_code 作为唯一标识（早期阶段债券没有 bond_code）
+                bond_code = bond.get('bond_code', '') or stock_code
+                
                 # 检查是否有变化
-                old = old_data.get(bond_code, {})
+                old = old_data.get(stock_code, {})
                 new_progress = bond.get('progress', '')
                 new_progress_full = bond.get('progress_full', '')
                 
@@ -202,9 +205,9 @@ class SQLiteDatabase:
                     old.get('progress_full') != new_progress_full
                 )
                 
-                if has_changed or bond_code not in old_data:
+                if has_changed or stock_code not in old_data:
                     changed_bonds.append(bond)
-                    if bond_code not in old_data:
+                    if stock_code not in old_data:
                         stats['new'] += 1
                     else:
                         stats['changed'] += 1
@@ -213,7 +216,8 @@ class SQLiteDatabase:
             
             # 保存变化的数据
             for bond in changed_bonds:
-                bond_code = bond.get('bond_code', '')
+                # 使用 stock_code 作为 fallback（早期阶段债券没有 bond_code）
+                bond_code = bond.get('bond_code', '') or bond.get('stock_code', '')
                 if not bond_code:
                     continue
                 

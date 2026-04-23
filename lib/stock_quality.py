@@ -25,14 +25,14 @@ from typing import Dict, List, Optional, Any, Tuple
 class StockQualityEvaluator:
     """股票质量评估器"""
     
-    def __init__(self, sina_api=None):
+    def __init__(self, kline_cache=None):
         """
         初始化评估器
-        
+
         Args:
-            sina_api: SinaFinanceAPI 实例，用于获取股价数据
+            kline_cache: BacktestCache 实例，用于获取K线数据
         """
-        self.sina_api = sina_api
+        self.kline_cache = kline_cache
     
     def evaluate(self, stock_code: str, prices: Optional[Dict] = None) -> Dict[str, Any]:
         """
@@ -56,8 +56,8 @@ class StockQualityEvaluator:
             - recommendation: 推荐意见
         """
         # 获取股价数据
-        if prices is None and self.sina_api:
-            prices = self.sina_api.fetch_history(stock_code, days=90)
+        if prices is None and self.kline_cache:
+            prices = self.kline_cache.get_kline_as_dict(stock_code, days=90)
         
         if not prices or len(prices) < 20:
             return {
