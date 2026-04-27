@@ -5,6 +5,7 @@
 管理注册+3天入场策略的完整生命周期：
 - 注册事件（同意注册）
 - 持仓管理（买入→卖出）
+- 理论信号（多策略扫描结果，与实际操作独立）
 - 每日监控快照
 
 用法:
@@ -12,9 +13,18 @@
 
     db = MonitorDB()
     db.record_registration({...})
-    db.create_position({...}, source='real')
-    db.execute_buy(position_id, buy_date, buy_price)
-    db.execute_sell(position_id, sell_date, sell_price, 'hold_7d')
+
+    # 理论信号（由 monitor_multi_strategy.py 自动写入）
+    db.upsert_theory_signal(code='300815', registration_date='2026-04-22', {
+        'triggered_strategies': ['broad_momentum'],
+        'theory_buy_price': 21.38,
+        'theory_exit_type': 'D+9',
+        'theory_factors': {'pre3': -1.5, 'mom10': 0.0},
+    })
+
+    # 实际买入/卖出（由用户手动记录）
+    db.record_actual_buy(code='300815', buy_date='2026-04-23', buy_price=21.38)
+    db.record_actual_sell(code='300815', sell_date='2026-05-06', sell_price=22.00)
 """
 
 import os
@@ -104,6 +114,30 @@ class MonitorDB:
                 )
             ''')
 
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS theory_signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT,
+                    bond_code TEXT,
+                    bond_name TEXT,
+                    registration_date TEXT NOT NULL,
+                    triggered_strategies TEXT DEFAULT '[]',
+                    strategy_labels TEXT DEFAULT '[]',
+                    calendar_diff INTEGER,
+                    trading_days INTEGER,
+                    theory_buy_date TEXT,
+                    theory_buy_price REAL,
+                    theory_exit_type TEXT,
+                    theory_factors TEXT DEFAULT '{}',
+                    theory_pnl_pct REAL,
+                    current_price REAL,
+                    current_date TEXT,
+                    scan_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(stock_code, registration_date)
+                )
+            ''')
+
             conn.execute('CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_positions_stock ON positions(stock_code)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_positions_planned_buy ON positions(planned_buy_date)')
@@ -122,12 +156,241 @@ class MonitorDB:
             has_source = any(col['name'] == 'source' for col in columns)
             if not has_source:
                 conn.execute('ALTER TABLE positions ADD COLUMN source TEXT DEFAULT \'real\'')
-                # 把已有的旧数据标记为 backfill
                 conn.execute('''
                     UPDATE positions SET source = 'backfill'
                     WHERE source IS NULL OR source = ''
                 ''')
                 conn.commit()
+
+    # ============================================================
+    # 理论信号（多策略扫描结果，与实际操作独立）
+    # ============================================================
+
+    def upsert_theory_signal(self, stock_code: str, registration_date: str,
+                             data: Dict) -> None:
+        """
+        写入/更新理论信号
+
+        Args:
+            data: {
+                stock_name, bond_code, bond_name,
+                triggered_strategies: ['broad_momentum', 'reversal_end'],
+                strategy_labels: ['宽幅动量信号', '回调结束企稳'],
+                calendar_diff: 5,
+                trading_days: 2,
+                theory_buy_date: '2026-04-23',
+                theory_buy_price: 21.38,
+                theory_exit_type: 'D+9',
+                theory_factors: {'pre3': -1.5, 'mom10': 0.0},
+                theory_pnl_pct: -4.5,
+                current_price: 20.42,
+                current_date: '2026-04-27',
+            }
+        """
+        with self._get_conn() as conn:
+            try:
+                conn.execute('''
+                    INSERT INTO theory_signals
+                        (stock_code, stock_name, bond_code, bond_name, registration_date,
+                         triggered_strategies, strategy_labels, calendar_diff, trading_days,
+                         theory_buy_date, theory_buy_price, theory_exit_type,
+                         theory_factors, theory_pnl_pct, current_price, current_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    stock_code,
+                    data.get('stock_name', ''),
+                    data.get('bond_code', ''),
+                    data.get('bond_name', ''),
+                    registration_date,
+                    json.dumps(data.get('triggered_strategies', []), ensure_ascii=False),
+                    json.dumps(data.get('strategy_labels', []), ensure_ascii=False),
+                    data.get('calendar_diff'),
+                    data.get('trading_days'),
+                    data.get('theory_buy_date', ''),
+                    data.get('theory_buy_price'),
+                    data.get('theory_exit_type', ''),
+                    json.dumps(data.get('theory_factors', {}), ensure_ascii=False),
+                    data.get('theory_pnl_pct'),
+                    data.get('current_price'),
+                    data.get('current_date', ''),
+                ))
+            except sqlite3.IntegrityError:
+                conn.execute('''
+                    UPDATE theory_signals SET
+                        stock_name = ?, bond_code = ?, bond_name = ?,
+                        triggered_strategies = ?, strategy_labels = ?,
+                        calendar_diff = ?, trading_days = ?,
+                        theory_buy_date = ?, theory_buy_price = ?, theory_exit_type = ?,
+                        theory_factors = ?, theory_pnl_pct = ?,
+                        current_price = ?, current_date = ?, scan_date = CURRENT_TIMESTAMP
+                    WHERE stock_code = ? AND registration_date = ?
+                ''', (
+                    data.get('stock_name', ''),
+                    data.get('bond_code', ''),
+                    data.get('bond_name', ''),
+                    json.dumps(data.get('triggered_strategies', []), ensure_ascii=False),
+                    json.dumps(data.get('strategy_labels', []), ensure_ascii=False),
+                    data.get('calendar_diff'),
+                    data.get('trading_days'),
+                    data.get('theory_buy_date', ''),
+                    data.get('theory_buy_price'),
+                    data.get('theory_exit_type', ''),
+                    json.dumps(data.get('theory_factors', {}), ensure_ascii=False),
+                    data.get('theory_pnl_pct'),
+                    data.get('current_price'),
+                    data.get('current_date', ''),
+                    stock_code, registration_date,
+                ))
+            conn.commit()
+
+    def get_theory_signals(self, stock_code: str = None) -> List[Dict]:
+        """获取理论信号，可按 code 过滤"""
+        with self._get_conn() as conn:
+            query = 'SELECT * FROM theory_signals WHERE 1=1'
+            params = []
+            if stock_code:
+                query += ' AND stock_code = ?'
+                params.append(stock_code)
+            query += ' ORDER BY registration_date DESC'
+            cursor = conn.execute(query, params)
+            rows = [dict(row) for row in cursor.fetchall()]
+            for r in rows:
+                r['triggered_strategies'] = json.loads(r.get('triggered_strategies', '[]'))
+                r['strategy_labels'] = json.loads(r.get('strategy_labels', '[]'))
+                r['theory_factors'] = json.loads(r.get('theory_factors', '{}'))
+            return rows
+
+    def delete_theory_signal(self, stock_code: str, registration_date: str) -> None:
+        """删除理论信号"""
+        with self._get_conn() as conn:
+            conn.execute('''
+                DELETE FROM theory_signals
+                WHERE stock_code = ? AND registration_date = ?
+            ''', (stock_code, registration_date))
+            conn.commit()
+
+    def record_actual_buy(self, stock_code: str, buy_date: str, buy_price: float,
+                          registration_date: str = None, stock_name: str = '') -> None:
+        """
+        记录实际买入（与理论信号独立，用户手动操作）
+        如果已有该 code+date 的 position 记录则更新，否则新建
+        """
+        pos_id = f"{stock_code}_{registration_date.replace('-', '')}" if registration_date else f"{stock_code}_{buy_date.replace('-', '')}"
+
+        with self._get_conn() as conn:
+            # 先查是否已有
+            row = conn.execute(
+                'SELECT * FROM positions WHERE position_id = ?', (pos_id,)
+            ).fetchone()
+
+            if row:
+                conn.execute('''
+                    UPDATE positions SET
+                        actual_buy_date = ?, actual_buy_price = ?,
+                        status = 'active', updated_at = CURRENT_TIMESTAMP
+                    WHERE position_id = ?
+                ''', (buy_date, buy_price, pos_id))
+            else:
+                conn.execute('''
+                    INSERT INTO positions
+                        (position_id, stock_code, stock_name, registration_date,
+                         actual_buy_date, actual_buy_price, status, source, buy_reason)
+                    VALUES (?, ?, ?, ?, ?, ?, 'active', 'manual', '用户手动录入')
+                ''', (pos_id, stock_code, stock_name,
+                      registration_date or '',
+                      buy_date, buy_price))
+            conn.commit()
+
+    def record_actual_sell(self, stock_code: str, sell_date: str, sell_price: float,
+                           sell_reason: str = '', registration_date: str = None) -> Dict:
+        """
+        记录实际卖出，计算收益（与理论信号独立）
+        Returns: 更新后的持仓数据
+        """
+        pos_id = f"{stock_code}_{registration_date.replace('-', '')}" if registration_date else f"{stock_code}_{sell_date.replace('-', '')}"
+
+        with self._get_conn() as conn:
+            pos = conn.execute(
+                'SELECT * FROM positions WHERE position_id = ?', (pos_id,)
+            ).fetchone()
+
+            if not pos:
+                raise ValueError(f'持仓不存在: {pos_id}，请先记录买入')
+
+            buy_price = pos['actual_buy_price'] or 0
+            return_pct = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
+            success = 1 if return_pct > 0 else 0
+
+            hold_days = 0
+            if pos['actual_buy_date']:
+                try:
+                    buy_dt = datetime.strptime(pos['actual_buy_date'], '%Y-%m-%d')
+                    sell_dt = datetime.strptime(sell_date, '%Y-%m-%d')
+                    hold_days = (sell_dt - buy_dt).days
+                except ValueError:
+                    pass
+
+            conn.execute('''
+                UPDATE positions SET
+                    actual_sell_date = ?, actual_sell_price = ?,
+                    sell_reason = ?, hold_days = ?, return_pct = ?, success = ?,
+                    status = 'closed', updated_at = CURRENT_TIMESTAMP
+                WHERE position_id = ?
+            ''', (sell_date, sell_price, sell_reason, hold_days, return_pct, success, pos_id))
+            conn.commit()
+
+            return {
+                'position_id': pos_id,
+                'return_pct': return_pct,
+                'success': success,
+                'hold_days': hold_days,
+            }
+
+    def get_position_comparison(self, stock_code: str) -> Optional[Dict]:
+        """
+        获取某只股票的理论 vs 实际对比数据
+        Returns: {
+            theory: {...},  # 理论信号
+            actual: {...},  # 实际持仓
+            comparison: {...}  # 对比
+        }
+        """
+        with self._get_conn() as conn:
+            theory = conn.execute('''
+                SELECT * FROM theory_signals WHERE stock_code = ?
+                ORDER BY registration_date DESC LIMIT 1
+            ''', (stock_code,)).fetchone()
+
+            actual = conn.execute('''
+                SELECT * FROM positions WHERE stock_code = ?
+                ORDER BY registration_date DESC LIMIT 1
+            ''', (stock_code,)).fetchone()
+
+            if not theory and not actual:
+                return None
+
+            t = dict(theory) if theory else None
+            a = dict(actual) if actual else None
+
+            if t:
+                t['triggered_strategies'] = json.loads(t.get('triggered_strategies', '[]'))
+                t['strategy_labels'] = json.loads(t.get('strategy_labels', '[]'))
+                t['theory_factors'] = json.loads(t.get('theory_factors', '{}'))
+
+            comparison = None
+            if t and a and a.get('actual_buy_price') and a.get('actual_sell_price'):
+                theory_ret = t.get('theory_pnl_pct', 0) or 0
+                actual_ret = a.get('return_pct', 0) or 0
+                comparison = {
+                    'theory_buy_price': t.get('theory_buy_price'),
+                    'actual_buy_price': a.get('actual_buy_price'),
+                    'price_diff_pct': ((a.get('actual_buy_price', 0) - (t.get('theory_buy_price') or 0)) / (t.get('theory_buy_price') or 1) * 100) if t.get('theory_buy_price') else 0,
+                    'theory_return_pct': theory_ret,
+                    'actual_return_pct': actual_ret,
+                    'return_diff_pct': actual_ret - theory_ret,
+                }
+
+            return {'theory': t, 'actual': a, 'comparison': comparison}
 
     # ============================================================
     # 注册事件

@@ -10,10 +10,14 @@
 
 监控模式:
   --scan     扫描今日注册事件，按策略分组输出
-  --hold     查看持仓中债券的止盈止损状态
+  --hold     查看持仓中债券的止盈止损状态（按策略动态退出）
   --once     scan + hold 一次运行（默认）
   --combo    组合模式输出（任一策略触发即报）
   --status   列出所有近期注册事件 + 各策略触发情况
+
+数据库:
+  --sync-db  将理论信号写入 monitor.db（theory_signals 表）
+  --compare CODE  查看某只股票的理论 vs 实际对比
 
 回测模式:
   --backtest              6个策略独立回测 (L=100/150/200)
@@ -29,6 +33,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lib.backtest_cache import BacktestCache
 from lib.strategies import registry
+from lib.monitor_db import MonitorDB
 
 
 def find_idx(sd, target):
@@ -76,7 +81,7 @@ def calc_factors(cache, sc, anchor):
         else:
             break
 
-    # D+1 buy price
+    # 注册日后第 N 个交易日开盘价（D+1 买入）
     buy_idx = ri + 1
     buy_price = None
     if buy_idx < len(sd):
@@ -523,6 +528,7 @@ def scan_registrations(cache):
             'name': (b.get('bond_name') or b.get('stock_name') or '?')[:12],
             'anchor': anchor,
             'calendar_diff': calendar_diff,
+            'days_since': factors.get('days_since', 0),
             'factors': factors,
             'triggered': triggered,
             'hit_count': hit_count,
@@ -604,80 +610,17 @@ def print_strategy_tags(triggered):
 
 # ========== 输出模式 ==========
 
-def mode_scan(cache):
-    """扫描 D+1 买入信号"""
-    signals = scan_buy_signals(cache)
-    today_str = datetime.now().strftime('%Y-%m-%d')
-
-    print(f"\n{'='*110}")
-    print(f"多策略组合监控 — {today_str}")
-    print(f"{'='*110}")
-
-    if not signals:
-        print(f"\n  今日无买入信号")
-        # 显示近期注册事件
-        all_results = scan_registrations(cache)
-        if all_results:
-            print(f"\n  近期注册事件 ({len(all_results)}只，20天内):")
-            print(f"  {'名称':<12} {'代码':>8} {'注册日':<12} {'天数':>4} {'策略触发'}")
-            print("  " + "-" * 90)
-            for r in all_results[:10]:
-                tag = print_strategy_tags(r['triggered']) or '—'
-                f = r['factors']
-                print(f"  {r['name']:<12} {r['code']:>8} {r['anchor']:<12} "
-                      f"D+{r['calendar_diff']:>3}  {tag}  "
-                      f"pre3={f['pre3']:+.1f}% mom10={f['mom10']:+.1f}% "
-                      f"rc={f['rc']:+.1f}% vol={f['vol_ratio5']:.2f}")
-        return
-
-    # 按触发数量排序（触发越多越优先）
-    signals.sort(key=lambda x: active_hit_count(x['triggered']), reverse=True)
-
-    print(f"\n  📢 买入信号 ({len(signals)}只, D+1开盘):")
-    print(f"  {'名称':<12} {'代码':>8} {'注册日':<12} {'买价':>8} {'触发策略':>50}")
-    print("  " + "-" * 95)
-
-    for s in signals:
-        f = s['factors']
-        tags = print_strategy_tags(s['triggered'])
-        bp = f"{s['factors']['buy_price']:.2f}" if s['factors']['buy_price'] else '--'
-        print(f"  {s['name']:<12} {s['code']:>8} {s['anchor']:<12} {bp:>8} {tags}")
-
-    # 按策略分组
-    print(f"\n  按策略分组:")
-    for key in registry.active_keys():
-        group = [s for s in signals if s['triggered'].get(key)]
-        if group:
-            print(f"    {_display_name(key)}  sh={registry.get(key).sharpe}  exit={registry.get(key).best_exit}")
-            for s in group:
-                bp = f"{s['factors']['buy_price']:.2f}" if s['factors']['buy_price'] else '--'
-                print(f"      {s['name']} {s['code']} 买价{bp}")
-
-
-def mode_hold(cache):
-    """持仓监控"""
-    holdings = scan_holdings(cache)
-    today_str = datetime.now().strftime('%Y-%m-%d')
-
-    print(f"\n  📊 持仓监控 ({len(holdings)}只):")
-    print(f"  {'名称':<12} {'代码':>8} {'持仓':>4} {'买价':>8} {'现价':>8} {'盈亏':>8} {'TP5':>4} {'SL5':>4} {'触发策略'}")
-    print("  " + "-" * 100)
-
-    if not holdings:
-        print(f"  无持仓")
-        return
-
-    holdings.sort(key=lambda x: x['calendar_diff'])
-    for h in holdings:
-        f = h['factors']
-        bp = f"{f['buy_price']:.2f}" if f['buy_price'] else '--'
-        cp = f"{f['current_close']:.2f}" if f['current_close'] else '--'
-        pnl = f"{f['pnl_pct']:+.1f}%" if f['pnl_pct'] is not None else '--'
-        tp = '✅' if f['pnl_pct'] and f['pnl_pct'] >= 5 else ' '
-        sl = '⚠️' if f['pnl_pct'] and f['pnl_pct'] <= -5 else ' '
-        tags = print_strategy_tags(h['triggered'])
-        print(f"  {h['name']:<12} {h['code']:>8} D+{h['calendar_diff']:>3} "
-              f"{bp:>8} {cp:>8} {pnl:>8} {tp} {sl} {tags}")
+def parse_exit_thresholds(exit_str):
+    """解析策略退出条件, 返回 (tp, sl) 百分比阈值"""
+    if not exit_str:
+        return 5, 5  # 默认 TP5/SL5
+    exit_str = exit_str.upper().replace(' ', '')
+    # 格式如 TP5/SL5, TP7/SL7, TP3/SL3, D+9
+    tp_m = re.search(r'TP(\d+)', exit_str)
+    sl_m = re.search(r'SL(\d+)', exit_str)
+    tp = int(tp_m.group(1)) if tp_m else 999
+    sl = int(sl_m.group(1)) if sl_m else 999
+    return tp, sl
 
 
 def mode_combo(cache):
@@ -710,8 +653,9 @@ def mode_combo(cache):
             f = s['factors']
             bp = f"{f['buy_price']:.2f}" if f['buy_price'] else '--'
             tags = print_strategy_tags(s['triggered'])
+            d = s.get('days_since', s['calendar_diff'])
             print(f"  {s['name']:<12} {s['code']:>8} {s['anchor']:<12} "
-                  f"D+{s['calendar_diff']:>3}  {active_hit_count(s['triggered'])}个策略  {tags:<48} 买价{bp}")
+                  f"T+{d:>3}  {active_hit_count(s['triggered'])}个策略  {tags:<48} 买价{bp}")
 
     if hold:
         print(f"\n  📊 持仓:")
@@ -719,8 +663,9 @@ def mode_combo(cache):
             f = h['factors']
             pnl = f"{f['pnl_pct']:+.1f}%" if f['pnl_pct'] is not None else '--'
             tags = print_strategy_tags(h['triggered'])
+            d = h.get('days_since', h['calendar_diff'])
             print(f"  {h['name']:<12} {h['code']:>8} {h['anchor']:<12} "
-                  f"D+{h['calendar_diff']:>3}  {active_hit_count(h['triggered'])}个策略  {tags:<48} {pnl}")
+                  f"T+{d:>3}  {active_hit_count(h['triggered'])}个策略  {tags:<48} {pnl}")
 
     if past:
         print(f"\n  已过退出期:")
@@ -728,8 +673,9 @@ def mode_combo(cache):
             f = p['factors']
             pnl = f"{f['pnl_pct']:+.1f}%" if f['pnl_pct'] is not None else '--'
             tags = print_strategy_tags(p['triggered'])
+            d = p.get('days_since', p['calendar_diff'])
             print(f"  {p['name']:<12} {p['code']:>8} {p['anchor']:<12} "
-                  f"D+{p['calendar_diff']:>3}  {active_hit_count(p['triggered'])}个策略  {tags:<48} {pnl}")
+                  f"T+{d:>3}  {active_hit_count(p['triggered'])}个策略  {tags:<48} {pnl}")
 
 
 def mode_status(cache):
@@ -752,22 +698,261 @@ def mode_status(cache):
         f = r['factors']
         t = r['triggered']
         cols = ' '.join(f"{'✅' if t.get(k) else '':>{col_w}}" for k in active)
+        d = r.get('days_since', r['calendar_diff'])
         print(f"  {r['name']:<12} {r['code']:>8} {r['anchor']:<12} "
-              f"D+{r['calendar_diff']:>3}  {cols}  "
+              f"T+{d:>3}  {cols}  "
               f"{f['pre3']:>+6.1f}% {f['mom10']:>+6.1f}% "
               f"{f['rc']:>+5.1f}% {f['vol_ratio5']:>5.2f}")
+
+
+def mode_sync_db(cache):
+    """将理论信号写入 monitor.db（自动跳过相同数据）"""
+    results = scan_registrations(cache)
+    db = MonitorDB()
+
+    # 获取所有触发策略的注册事件
+    triggered_results = [r for r in results
+                        if any(r['triggered'].get(k) for k in registry.active_keys())]
+
+    if not triggered_results:
+        return 0
+
+    synced = 0
+    for r in triggered_results:
+        f = r['factors']
+        triggered_keys = [k for k in registry.active_keys() if r['triggered'].get(k)]
+        triggered_labels = [_short_name(k) for k in registry.active_keys() if r['triggered'].get(k)]
+
+        # 取第一个触发策略的退出方式
+        exit_type = ''
+        if triggered_keys:
+            s = registry.get(triggered_keys[0])
+            if s:
+                exit_type = s.best_exit or 'D+9'
+
+        # 读取实际数据（如果用户已手动录入）
+        actual = db.get_position_comparison(r['code'])
+        has_actual = False
+        if actual and actual.get('actual'):
+            a = actual['actual']
+            has_actual = bool(a.get('actual_buy_price') or a.get('actual_sell_price'))
+
+        db.upsert_theory_signal(r['code'], r['anchor'], {
+            'stock_name': r.get('name', ''),
+            'triggered_strategies': triggered_keys,
+            'strategy_labels': triggered_labels,
+            'calendar_diff': r['calendar_diff'],
+            'trading_days': r.get('days_since', 0),
+            'theory_buy_date': (datetime.strptime(r['anchor'], '%Y-%m-%d')
+                              + __import__('datetime').timedelta(days=1)).strftime('%Y-%m-%d')
+            if r['anchor'] else '',
+            'theory_buy_price': f['buy_price'],
+            'theory_exit_type': exit_type,
+            'theory_factors': {k: v for k, v in f.items()
+                             if k not in ('buy_price', 'current_close', 'current_date',
+                                         'days_since', 'pnl_pct')},
+            'theory_pnl_pct': f.get('pnl_pct'),
+            'current_price': f.get('current_price'),
+            'current_date': f.get('current_date'),
+        })
+        synced += 1
+
+    return synced
+
+
+def mode_scan(cache):
+    """扫描 D+1 买入信号 + 同步理论信号到数据库"""
+    db = MonitorDB()
+    signals = scan_buy_signals(cache)
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
+    # 同步理论信号
+    synced = mode_sync_db(cache)
+
+    print(f"\n{'='*110}")
+    print(f"多策略组合监控 — {today_str}" + (f" (同步 {synced} 个理论信号)" if synced else ""))
+    print(f"{'='*110}")
+
+    if not signals:
+        print(f"\n  今日无买入信号")
+        # 显示近期注册事件（附加实际数据）
+        all_results = scan_registrations(cache)
+        if all_results:
+            print(f"\n  近期注册事件 ({len(all_results)}只，20天内):")
+            print(f"  {'名称':<12} {'代码':>8} {'注册日':<12} {'天数':>4} {'策略触发'}")
+            print("  " + "-" * 90)
+            for r in all_results[:10]:
+                tag = print_strategy_tags(r['triggered']) or '—'
+                f = r['factors']
+                d = r.get('days_since', r['calendar_diff'])
+
+                # 读取实际数据
+                actual_info = ''
+                comp = db.get_position_comparison(r['code'])
+                if comp and comp.get('actual'):
+                    a = comp['actual']
+                    if a.get('actual_buy_price'):
+                        buy_p = f"买={a['actual_buy_price']:.2f}"
+                        if a.get('actual_sell_price'):
+                            sell_p = f"卖={a['actual_sell_price']:.2f}"
+                            ret_p = f"收益={a.get('return_pct', 0):+.1f}%"
+                            actual_info = f" [{buy_p} {sell_p} {ret_p}]"
+                        else:
+                            actual_info = f" [{buy_p} 持仓中]"
+                    elif a.get('status') == 'closed':
+                        actual_info = f" [已平仓]"
+
+                print(f"  {r['name']:<12} {r['code']:>8} {r['anchor']:<12} "
+                      f"T+{d:>3}  {tag}{actual_info}  "
+                      f"pre3={f['pre3']:+.1f}% mom10={f['mom10']:+.1f}% "
+                      f"rc={f['rc']:+.1f}% vol={f['vol_ratio5']:.2f}")
+        return
+
+    # 按触发数量排序（触发越多越优先）
+    signals.sort(key=lambda x: active_hit_count(x['triggered']), reverse=True)
+
+    print(f"\n  📢 买入信号 ({len(signals)}只, D+1开盘):")
+    print(f"  {'名称':<12} {'代码':>8} {'注册日':<12} {'买价':>8} {'触发策略':>50}")
+    print("  " + "-" * 95)
+
+    for s in signals:
+        f = s['factors']
+        tags = print_strategy_tags(s['triggered'])
+        bp = f"{s['factors']['buy_price']:.2f}" if s['factors']['buy_price'] else '--'
+        print(f"  {s['name']:<12} {s['code']:>8} {s['anchor']:<12} {bp:>8} {tags}")
+
+    # 按策略分组
+    print(f"\n  按策略分组:")
+    for key in registry.active_keys():
+        group = [s for s in signals if s['triggered'].get(key)]
+        if group:
+            print(f"    {_display_name(key)}  sh={registry.get(key).sharpe}  exit={registry.get(key).best_exit}")
+            for s in group:
+                bp = f"{s['factors']['buy_price']:.2f}" if s['factors']['buy_price'] else '--'
+                print(f"      {s['name']} {s['code']} 买价{bp}")
+
+
+def mode_hold(cache):
+    """持仓监控 — 按策略动态退出信号 + 显示实际数据"""
+    db = MonitorDB()
+    holdings = scan_holdings(cache)
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
+    print(f"\n  📊 持仓监控 ({len(holdings)}只):")
+    print(f"  {'名称':<12} {'代码':>8} {'持仓':>4} {'买价':>8} {'现价':>8} {'盈亏':>8} {'止盈止损':>6} {'触发策略'}")
+    print("  " + "-" * 100)
+
+    if not holdings:
+        print(f"  无持仓")
+        return
+
+    holdings.sort(key=lambda x: x['calendar_diff'])
+    for h in holdings:
+        f = h['factors']
+        bp = f"{f['buy_price']:.2f}" if f['buy_price'] else '--'
+        cp = f"{f['current_close']:.2f}" if f['current_close'] else '--'
+        pnl = f"{f['pnl_pct']:+.1f}%" if f['pnl_pct'] is not None else '--'
+
+        # 从触发的策略中取最优退出阈值
+        triggered_keys = [k for k in registry.active_keys() if h['triggered'].get(k)]
+        tp_val, sl_val = 5, 5
+        exit_label = 'D+9'
+        if triggered_keys:
+            s = registry.get(triggered_keys[0])
+            if s:
+                tp_val, sl_val = parse_exit_thresholds(s.best_exit)
+                exit_label = s.best_exit or 'D+9'
+
+        tp_mark = '✅' if f['pnl_pct'] and f['pnl_pct'] >= tp_val else ' '
+        sl_mark = '⚠️' if f['pnl_pct'] and f['pnl_pct'] <= -sl_val else ' '
+        exit_str = f"{tp_mark}{sl_mark} ({exit_label})"
+        tags = print_strategy_tags(h['triggered'])
+
+        # 显示交易日天数
+        display_days = h.get('days_since', h['calendar_diff'])
+
+        # 读取实际数据
+        actual_info = ''
+        comp = db.get_position_comparison(h['code'])
+        if comp and comp.get('actual'):
+            a = comp['actual']
+            if a.get('actual_buy_price'):
+                actual_buy = f"{a['actual_buy_price']:.2f}"
+                if a.get('actual_sell_price'):
+                    actual_sell = f"{a['actual_sell_price']:.2f}"
+                    actual_ret = f"{a.get('return_pct', 0):+.1f}%"
+                    actual_info = f" |实际:买{actual_buy}卖{actual_sell}收{actual_ret}"
+                else:
+                    actual_info = f" |实际:买{actual_buy}持仓中"
+            elif a.get('status') == 'closed':
+                actual_info = f" |实际:已平仓"
+
+        print(f"  {h['name']:<12} {h['code']:>8} T+{display_days:>3} "
+              f"{bp:>8} {cp:>8} {pnl:>8} {exit_str:>8} {tags}{actual_info}")
+
+
+def mode_compare(cache, stock_code):
+    """查看理论 vs 实际对比"""
+    db = MonitorDB()
+    comp = db.get_position_comparison(stock_code)
+
+    print(f"\n{'='*110}")
+    print(f"  理论 vs 实际对比 — {stock_code}")
+    print(f"{'='*110}")
+
+    if not comp:
+        print(f"\n  无数据")
+        return
+
+    theory = comp.get('theory')
+    actual = comp.get('actual')
+    comparison = comp.get('comparison')
+
+    if theory:
+        print(f"\n  📊 理论信号:")
+        print(f"    注册日: {theory.get('registration_date', '')}")
+        print(f"    策略: {', '.join(theory.get('triggered_strategies', []))}")
+        print(f"    买入价: {theory.get('theory_buy_price', '--')}")
+        print(f"    退出方式: {theory.get('theory_exit_type', '--')}")
+        print(f"    理论收益: {theory.get('theory_pnl_pct', '--'):+.2f}%")
+        factors = theory.get('theory_factors', {})
+        if factors:
+            factor_str = ' '.join(f"{k}={v:+.2f}" if isinstance(v, float) else f"{k}={v}"
+                                 for k, v in factors.items()
+                                 if k in ('pre3', 'mom10', 'rc', 'vol_ratio5', 'consec_down'))
+            print(f"    因子: {factor_str}")
+
+    if actual:
+        print(f"\n  📊 实际操作:")
+        print(f"    买入日: {actual.get('actual_buy_date', '--')}")
+        print(f"    买入价: {actual.get('actual_buy_price', '--')}")
+        print(f"    卖出日: {actual.get('actual_sell_date', '--')}")
+        print(f"    卖出价: {actual.get('actual_sell_price', '--')}")
+        print(f"    持仓天数: {actual.get('hold_days', '--')}")
+        print(f"    实际收益: {actual.get('return_pct', '--'):+.2f}%")
+        print(f"    状态: {actual.get('status', '--')}")
+
+    if comparison:
+        print(f"\n  📊 对比:")
+        print(f"    买入价差异: {comparison['price_diff_pct']:+.2f}%")
+        print(f"    理论收益: {comparison['theory_return_pct']:+.2f}%")
+        print(f"    实际收益: {comparison['actual_return_pct']:+.2f}%")
+        print(f"    收益差异: {comparison['return_diff_pct']:+.2f}%")
 
 
 # ========== 主入口 ==========
 
 def main():
     cache = BacktestCache()
+    db = MonitorDB()
 
     args = sys.argv[1:]
     mode = '--once'
     combo_mode = None
     is_backtest = False
     disable_keys = []
+    is_sync_db = False
+    compare_code = None
 
     i = 0
     while i < len(args):
@@ -792,6 +977,12 @@ def main():
         elif args[i] == '--once':
             mode = '--once'
             i += 1
+        elif args[i] == '--sync-db':
+            is_sync_db = True
+            i += 1
+        elif args[i] == '--compare' and i + 1 < len(args):
+            compare_code = args[i+1]
+            i += 2
         else:
             i += 1
 
@@ -799,7 +990,6 @@ def main():
         registry.disable(disable_keys)
 
     if is_backtest:
-        # 检测 combo 参数
         for a in args:
             if a == '--combo':
                 combo_mode = 'union'
@@ -807,6 +997,14 @@ def main():
         if 'all' in args:
             combo_mode = 'all'
         mode_backtest(cache, combo_mode)
+        return
+
+    if is_sync_db:
+        mode_sync_db(cache)
+        return
+
+    if compare_code:
+        mode_compare(cache, compare_code)
         return
 
     if mode == '--scan':
@@ -822,7 +1020,6 @@ def main():
         mode_hold(cache)
         print()
         print(f"{'='*110}")
-        # 策略说明
         print("策略说明:")
         for key in registry.active_keys():
             s = registry.get(key)
@@ -830,7 +1027,7 @@ def main():
         print(f"{'='*110}")
     else:
         print(f"未知模式: {mode}")
-        print("可用: --scan --hold --once --combo --status")
+        print("可用: --scan --hold --once --combo --status --sync-db --compare CODE")
         print("回测: --backtest [--combo]")
 
 
