@@ -12,7 +12,7 @@
 
     db = MonitorDB()
     db.record_registration({...})
-    db.create_position({...})
+    db.create_position({...}, source='real')
     db.execute_buy(position_id, buy_date, buy_price)
     db.execute_sell(position_id, sell_date, sell_price, 'hold_7d')
 """
@@ -83,6 +83,7 @@ class MonitorDB:
                     success INTEGER,
                     notes TEXT,
                     status TEXT DEFAULT 'scheduled',
+                    source TEXT DEFAULT 'real',
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
@@ -108,8 +109,25 @@ class MonitorDB:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_positions_planned_buy ON positions(planned_buy_date)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_positions_planned_sell ON positions(planned_sell_date)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_reg_date ON registration_events(registration_date)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_positions_source ON positions(source)')
 
             conn.commit()
+
+        # 迁移旧表：如果缺少 source 字段则添加
+        self._migrate_add_source_column()
+
+    def _migrate_add_source_column(self):
+        with self._get_conn() as conn:
+            columns = conn.execute('PRAGMA table_info(positions)').fetchall()
+            has_source = any(col['name'] == 'source' for col in columns)
+            if not has_source:
+                conn.execute('ALTER TABLE positions ADD COLUMN source TEXT DEFAULT \'real\'')
+                # 把已有的旧数据标记为 backfill
+                conn.execute('''
+                    UPDATE positions SET source = 'backfill'
+                    WHERE source IS NULL OR source = ''
+                ''')
+                conn.commit()
 
     # ============================================================
     # 注册事件
@@ -178,13 +196,14 @@ class MonitorDB:
     # 持仓管理
     # ============================================================
 
-    def create_position(self, position: Dict) -> str:
+    def create_position(self, position: Dict, source: str = 'real') -> str:
         """
         创建新的持仓
 
         Args:
             position: {position_id, stock_code, stock_name, bond_code, bond_name,
                        registration_date, planned_buy_date, planned_sell_date}
+            source: 'real'（真实监控）或 'backfill'（历史回填）
 
         Returns:
             position_id
@@ -195,8 +214,8 @@ class MonitorDB:
                 conn.execute('''
                     INSERT INTO positions
                     (position_id, stock_code, stock_name, bond_code, bond_name,
-                     registration_date, planned_buy_date, planned_sell_date, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'scheduled')
+                     registration_date, planned_buy_date, planned_sell_date, status, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?)
                 ''', (
                     position_id,
                     position.get('stock_code', ''),
@@ -206,6 +225,7 @@ class MonitorDB:
                     position.get('registration_date', ''),
                     position.get('planned_buy_date', ''),
                     position.get('planned_sell_date', ''),
+                    source,
                 ))
                 conn.commit()
             except sqlite3.IntegrityError:
@@ -213,11 +233,12 @@ class MonitorDB:
         return position_id
 
     def get_positions_due_to_buy(self, trade_date: str) -> List[Dict]:
-        """获取计划买入日期 <= trade_date 的 scheduled 持仓"""
+        """获取计划买入日期 <= trade_date 的 scheduled 持仓（只查 real）"""
         with self._get_conn() as conn:
             cursor = conn.execute('''
                 SELECT * FROM positions
                 WHERE status = 'scheduled'
+                  AND source = 'real'
                   AND planned_buy_date <= ?
                 ORDER BY planned_buy_date
             ''', (trade_date,))
@@ -229,28 +250,41 @@ class MonitorDB:
             cursor = conn.execute('''
                 SELECT * FROM positions
                 WHERE status = 'active'
+                  AND source = 'real'
                   AND planned_sell_date <= ?
                 ORDER BY planned_sell_date
             ''', (trade_date,))
             return [dict(row) for row in cursor.fetchall()]
 
     def get_active_positions(self) -> List[Dict]:
-        """获取所有 active 持仓"""
+        """获取所有 active 持仓（只查 real）"""
         with self._get_conn() as conn:
             cursor = conn.execute('''
                 SELECT * FROM positions
                 WHERE status = 'active'
+                  AND source = 'real'
                 ORDER BY actual_buy_date
             ''')
             return [dict(row) for row in cursor.fetchall()]
 
     def get_scheduled_positions(self) -> List[Dict]:
-        """获取所有 scheduled 持仓"""
+        """获取所有 scheduled 持仓（只查 real）"""
         with self._get_conn() as conn:
             cursor = conn.execute('''
                 SELECT * FROM positions
                 WHERE status = 'scheduled'
+                  AND source = 'real'
                 ORDER BY planned_buy_date
+            ''')
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_backfill_positions(self) -> List[Dict]:
+        """获取 backfill 持仓（用于显示）"""
+        with self._get_conn() as conn:
+            cursor = conn.execute('''
+                SELECT * FROM positions
+                WHERE source = 'backfill'
+                ORDER BY registration_date
             ''')
             return [dict(row) for row in cursor.fetchall()]
 
@@ -338,9 +372,10 @@ class MonitorDB:
             return dict(row) if row else None
 
     def get_closed_positions(self, start_date: str = None, end_date: str = None) -> List[Dict]:
-        """获取已平仓持仓"""
+        """获取已平仓持仓（只查 real）"""
         with self._get_conn() as conn:
-            query = 'SELECT * FROM positions WHERE status = \'closed\''
+            query = '''SELECT * FROM positions
+                       WHERE status = 'closed' AND source = 'real' '''
             params = []
             if start_date:
                 query += ' AND actual_sell_date >= ?'
@@ -353,18 +388,22 @@ class MonitorDB:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_position_stats(self) -> Dict:
-        """计算已平仓持仓的统计信息"""
+        """
+        计算已平仓持仓的统计信息（只统计 source='real' 的真实数据）
+        """
         with self._get_conn() as conn:
             cursor = conn.execute('''
                 SELECT
                     COUNT(*) as total,
-                    SUM(success) as wins,
+                    COALESCE(SUM(success), 0) as wins,
                     AVG(return_pct) as avg_return,
                     MAX(return_pct) as best,
                     MIN(return_pct) as worst,
                     AVG(hold_days) as avg_hold_days
                 FROM positions
-                WHERE status = 'closed' AND return_pct IS NOT NULL
+                WHERE status = 'closed'
+                  AND source = 'real'
+                  AND return_pct IS NOT NULL
             ''')
             row = cursor.fetchone()
             if not row or row['total'] == 0:
@@ -458,6 +497,7 @@ class MonitorDB:
             'scheduled': self.get_scheduled_positions(),
             'active': self.get_active_positions(),
             'closed': self.get_closed_positions(),
+            'backfill': self.get_backfill_positions(),
             'stats': self.get_position_stats(),
             'latest_snapshot': self.get_latest_snapshot(),
         }
@@ -473,6 +513,31 @@ class MonitorDB:
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         return output_path
+
+    def reset_backfill_data(self) -> Dict:
+        """
+        清理所有 backfill 数据（注册事件 + 持仓），为重新回填做准备
+
+        Returns:
+            {registrations_deleted, positions_deleted}
+        """
+        with self._get_conn() as conn:
+            r1 = conn.execute(
+                "DELETE FROM registration_events WHERE id IN ("
+                "  SELECT re.id FROM registration_events re "
+                "  LEFT JOIN positions p ON re.stock_code = p.stock_code "
+                "     AND re.registration_date = p.registration_date "
+                "  WHERE p.source = 'backfill' OR p.id IS NULL"
+                ")"
+            ).rowcount
+            r2 = conn.execute(
+                "DELETE FROM positions WHERE source = 'backfill'"
+            ).rowcount
+            conn.commit()
+            return {
+                'registrations_deleted': r1,
+                'positions_deleted': r2,
+            }
 
 
 # 全局实例

@@ -18,6 +18,7 @@
 
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -45,7 +46,74 @@ class BacktestCache:
     def _init_db(self):
         """初始化数据库表"""
         with self._get_conn() as conn:
-            # 集思录待发转债快照
+            # 集思录转债统一表（待发+已上市）
+            # UNIQUE(stock_code, bond_id)：bond_id 为空时用 stock_code 去重
+            conn.execute('DROP TABLE IF EXISTS jisilu_pending_bonds')
+            conn.execute('DROP TABLE IF EXISTS jisilu_history_bonds')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS jisilu_bonds (
+                    stock_code TEXT NOT NULL,
+                    bond_id TEXT NOT NULL DEFAULT '',
+                    stock_nm TEXT,
+                    bond_nm TEXT,
+                    price REAL,
+                    increase_rt REAL,
+                    pma_rt REAL,
+                    margin_flg TEXT,
+                    pb REAL,
+                    rid INTEGER,
+                    audit_id TEXT,
+                    registration TEXT,
+                    progress TEXT,
+                    progress_nm TEXT,
+                    progress_nm2 TEXT,
+                    progress_dt TEXT,
+                    progress_full TEXT,
+                    accept_date TEXT,
+                    amount REAL,
+                    convert_price REAL,
+                    cb_amount REAL,
+                    cb_flag TEXT,
+                    cb_type TEXT,
+                    ap_flag TEXT,
+                    apply_date TEXT,
+                    apply_cd TEXT,
+                    apply10 INTEGER,
+                    apply_tips TEXT,
+                    ration_cd TEXT,
+                    ration REAL,
+                    ration_rt TEXT,
+                    record_dt TEXT,
+                    record_price REAL,
+                    list_date TEXT,
+                    list_price REAL,
+                    status_cd TEXT,
+                    ma20_price REAL,
+                    online_amount TEXT,
+                    lucky_draw_rt TEXT,
+                    single_draw TEXT,
+                    valid_apply TEXT,
+                    individual_limit INTEGER,
+                    underwriter_rt TEXT,
+                    rating_cd TEXT,
+                    offline_limit TEXT,
+                    offline_accounts TEXT,
+                    offline_draw TEXT,
+                    valid_apply_raw TEXT,
+                    jsl_advise_text TEXT,
+                    b_shares TEXT,
+                    pg_shares TEXT,
+                    naps TEXT,
+                    cp_flag TEXT,
+                    orders INTEGER,
+                    fetched_at TEXT,
+                    UNIQUE(stock_code, bond_id)
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_bonds_stock ON jisilu_bonds(stock_code)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_bonds_list_date ON jisilu_bonds(list_date)')
+
+            # 集思录待发转债快照（保留用于变更检测）
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS jisilu_pending_bonds (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -256,99 +324,172 @@ class BacktestCache:
             conn.commit()
 
     # ============================================================
-    # 集思录快照
+    # 集思录数据（统一表：待发 + 已上市）
     # ============================================================
 
-    def save_jisilu_snapshot(self) -> Dict[str, int]:
+    def save_jisilu_data(self, fetch_pending: bool = True, fetch_history: bool = False) -> Dict[str, int]:
         """
-        从集思录获取快照并缓存到数据库
+        获取集思录待发+已上市数据，合并写入 jisilu_bonds 表
+
+        Args:
+            fetch_pending: 是否获取待发数据（history=N），默认 True
+            fetch_history: 是否获取已上市历史数据（history=Y），默认 False（只需获取一次）
 
         Returns:
-            {total: N, new: N, changed: N, unchanged: N}
+            {total: N, new: N, updated: N}
         """
-        from lib.data_source import JisiluAPI
+        import urllib.request
 
-        jsl = JisiluAPI(timeout=30)
-        bonds = jsl.fetch_pending_bonds(limit=200)
-        if not bonds:
-            print('⚠️  集思录数据获取失败')
-            return {'total': 0, 'new': 0, 'changed': 0, 'unchanged': 0}
-
-        today = datetime.now().strftime('%Y-%m-%d')
         now = datetime.now().isoformat()
+        stats = {'total': 0, 'new': 0, 'updated': 0}
+
+        def _item_to_row(item: dict, status: str) -> tuple:
+            stock_code = item.get('stock_id', '') or ''
+            bond_id = item.get('bond_id', '') or ''
+
+            def _num(v):
+                if v is None:
+                    return None
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    return None
+
+            return (
+                stock_code, bond_id,
+                item.get('stock_nm', ''),
+                item.get('bond_nm', ''),
+                _num(item.get('price')),
+                _num(item.get('increase_rt')),
+                _num(item.get('pma_rt')) if item.get('pma_rt') not in (None, '') else None,
+                item.get('margin_flg', ''),
+                _num(item.get('pb')),
+                item.get('rid'),
+                item.get('audit_id'),
+                item.get('registration', ''),
+                item.get('progress', ''),
+                item.get('progress_nm', ''),
+                item.get('progress_nm2', ''),
+                item.get('progress_dt', ''),
+                item.get('progress_full', ''),
+                item.get('accept_date', ''),
+                _num(item.get('amount')),
+                _num(item.get('convert_price')),
+                _num(item.get('cb_amount')),
+                item.get('cb_flag', ''),
+                item.get('cb_type', ''),
+                item.get('ap_flag', ''),
+                item.get('apply_date', ''),
+                item.get('apply_cd', ''),
+                item.get('apply10'),
+                item.get('apply_tips', ''),
+                item.get('ration_cd', ''),
+                _num(item.get('ration')),
+                item.get('ration_rt', ''),
+                item.get('record_dt', ''),
+                _num(item.get('record_price')),
+                item.get('list_date', ''),
+                _num(item.get('list_price')),
+                status,
+                _num(item.get('ma20_price')) if item.get('ma20_price') not in (None, '') else None,
+                item.get('online_amount', ''),
+                item.get('lucky_draw_rt', ''),
+                item.get('single_draw', ''),
+                item.get('valid_apply', ''),
+                item.get('individual_limit'),
+                item.get('underwriter_rt', ''),
+                item.get('rating_cd', ''),
+                item.get('offline_limit', ''),
+                item.get('offline_accounts', ''),
+                item.get('offline_draw', ''),
+                item.get('valid_apply_raw', ''),
+                item.get('jsl_advise_text', ''),
+                item.get('b_shares', ''),
+                item.get('pg_shares', ''),
+                item.get('naps'),
+                item.get('cp_flag', ''),
+                item.get('orders'),
+                now,
+            )
 
         with self._get_conn() as conn:
-            # 获取上次快照
-            cursor = conn.execute(
-                'SELECT stock_code, progress_nm, progress_full FROM jisilu_pending_bonds WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM jisilu_pending_bonds WHERE snapshot_date < ?)',
-                (today,)
-            )
-            old_data = {row['stock_code']: {'progress_nm': row['progress_nm'], 'progress_full': row['progress_full']} for row in cursor.fetchall()}
+            # 1. 待发数据 (history=N) — 默认获取
+            if fetch_pending:
+                url = 'https://www.jisilu.cn/webapi/cb/pre/'
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+                    'Referer': 'https://www.jisilu.cn/data/cbnew/',
+                }
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        data = json.loads(resp.read().decode('utf-8'))
+                    # 待发 API 返回 {"code": 200, "data": {"rows": [{"cell": {...}}]}}
+                    rows = data.get('data', {}).get('rows', [])
+                    for row in rows:
+                        item = row.get('cell', {})
+                        item_row = _item_to_row(item, 'ON')
+                        conn.execute('''
+                            INSERT OR REPLACE INTO jisilu_bonds
+                            (stock_code, bond_id, stock_nm, bond_nm, price, increase_rt, pma_rt,
+                             margin_flg, pb, rid, audit_id, registration, progress, progress_nm,
+                             progress_nm2, progress_dt, progress_full, accept_date, amount,
+                             convert_price, cb_amount, cb_flag, cb_type, ap_flag, apply_date,
+                             apply_cd, apply10, apply_tips, ration_cd, ration, ration_rt, record_dt,
+                             record_price, list_date, list_price, status_cd, ma20_price, online_amount,
+                             lucky_draw_rt, single_draw, valid_apply, individual_limit, underwriter_rt,
+                             rating_cd, offline_limit, offline_accounts, offline_draw, valid_apply_raw,
+                             jsl_advise_text, b_shares, pg_shares, naps, cp_flag, orders, fetched_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', item_row)
+                        stats['total'] += 1
+                except Exception as e:
+                    print(f'⚠️  待发数据获取失败: {e}')
 
-            stats = {'total': len(bonds), 'new': 0, 'changed': 0, 'unchanged': 0}
-
-            for bond in bonds:
-                stock_code = bond.get('stock_code', '')
-                if not stock_code:
-                    continue
-
-                old = old_data.get(stock_code, {})
-                has_changed = (
-                    old.get('progress_nm') != bond.get('progress_nm') or
-                    old.get('progress_full') != bond.get('progress_full')
-                )
-
-                conn.execute('''
-                    INSERT OR REPLACE INTO jisilu_pending_bonds
-                    (stock_code, stock_nm, bond_id, bond_nm, apply_date, apply_cd, ration_cd,
-                     record_dt, record_price, ration, amount, convert_price, rating_cd,
-                     progress_nm, progress_full, status_cd, margin_flg, snapshot_date, fetched_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    stock_code,
-                    bond.get('stock_name', ''),
-                    bond.get('bond_code', ''),
-                    bond.get('bond_name', ''),
-                    bond.get('apply_date', ''),
-                    bond.get('apply_code', ''),
-                    bond.get('ration_code', ''),
-                    bond.get('record_date', ''),
-                    bond.get('record_price', 0),
-                    bond.get('ration', 0),
-                    bond.get('amount', 0),
-                    bond.get('convert_price', 0),
-                    bond.get('rating', ''),
-                    bond.get('progress', ''),
-                    bond.get('progress_full', ''),
-                    bond.get('status', ''),
-                    bond.get('market', ''),
-                    today,
-                    now,
-                ))
-
-                if stock_code not in old_data:
-                    stats['new'] += 1
-                elif has_changed:
-                    stats['changed'] += 1
-                else:
-                    stats['unchanged'] += 1
+            # 2. 历史数据 (history=Y) — 已上市，可选（只需获取一次）
+            if fetch_history:
+                url = 'https://www.jisilu.cn/webapi/cb/pre/?history=Y'
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+                    'Referer': 'https://www.jisilu.cn/data/cbnew/#title1',
+                }
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        data = json.loads(resp.read().decode('utf-8'))
+                    for item in data.get('data', []):
+                        row = _item_to_row(item, 'OK')
+                        conn.execute('''
+                            INSERT OR REPLACE INTO jisilu_bonds
+                            (stock_code, bond_id, stock_nm, bond_nm, price, increase_rt, pma_rt,
+                             margin_flg, pb, rid, audit_id, registration, progress, progress_nm,
+                             progress_nm2, progress_dt, progress_full, accept_date, amount,
+                             convert_price, cb_amount, cb_flag, cb_type, ap_flag, apply_date,
+                             apply_cd, apply10, apply_tips, ration_cd, ration, ration_rt, record_dt,
+                             record_price, list_date, list_price, status_cd, ma20_price, online_amount,
+                             lucky_draw_rt, single_draw, valid_apply, individual_limit, underwriter_rt,
+                             rating_cd, offline_limit, offline_accounts, offline_draw, valid_apply_raw,
+                             jsl_advise_text, b_shares, pg_shares, naps, cp_flag, orders, fetched_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', row)
+                        stats['total'] += 1
+                except Exception as e:
+                    print(f'⚠️  历史数据获取失败: {e}')
 
             conn.commit()
 
-        print(f'💾 集思录快照已保存 | 总数: {stats["total"]}, 新增: {stats["new"]}, 变化: {stats["changed"]}, 未变: {stats["unchanged"]}')
+        print(f'💾 集思录数据已保存 | jisilu_bonds: {stats["total"]} 只')
         return stats
 
     def get_latest_jisilu_data(self) -> List[Dict[str, Any]]:
         """
-        获取最新快照的待发转债数据（带字段名标准化）
+        获取集思录所有转债数据（待发 + 已上市，统一从 jisilu_bonds 表读取）
 
         Returns:
             列表，每项字段与 BondDataSource 格式一致
         """
         with self._get_conn() as conn:
-            cursor = conn.execute(
-                'SELECT * FROM jisilu_pending_bonds WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM jisilu_pending_bonds)'
-            )
+            cursor = conn.execute('SELECT * FROM jisilu_bonds')
             rows = cursor.fetchall()
 
         if not rows:
@@ -379,38 +520,160 @@ class BacktestCache:
                 'status': d.get('status_cd', ''),
                 'market': d.get('margin_flg', ''),
                 'source': 'jisilu',
+                # 附加字段（已上市债有值）
+                'list_date': d.get('list_date', ''),
+                'list_price': d.get('list_price', 0),
+                'cb_flag': d.get('cb_flag', ''),
+                'cb_type': d.get('cb_type', ''),
             })
         return result
 
     def get_jisilu_history(self, stock_code: str, start_date: str = None, end_date: str = None) -> List[Dict[str, Any]]:
         """
-        获取某只转债的历史进度变化
+        获取某只转债的数据（从统一表读取）
 
         Args:
             stock_code: 股票代码
-            start_date: 起始日期 YYYY-MM-DD
-            end_date: 结束日期 YYYY-MM-DD
+            start_date: 预留，未实现快照过滤
+            end_date: 预留，未实现快照过滤
 
         Returns:
-            历史记录列表
+            记录列表
         """
-        query = 'SELECT * FROM jisilu_pending_bonds WHERE stock_code = ?'
+        query = 'SELECT * FROM jisilu_bonds WHERE stock_code = ?'
         params: list = [stock_code]
-
-        if start_date:
-            query += ' AND snapshot_date >= ?'
-            params.append(start_date)
-        if end_date:
-            query += ' AND snapshot_date <= ?'
-            params.append(end_date)
-
-        query += ' ORDER BY snapshot_date'
 
         with self._get_conn() as conn:
             cursor = conn.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
-    # ============================================================
+    def get_jisilu_bonds(
+        self,
+        phase: str = None,
+        status_cd: str = None,
+        cb_type: str = None,
+        limit: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        按阶段/状态查询集思录转债数据
+
+        Args:
+            phase: 阶段筛选（查 progress_full 历史进度线）
+                "待发"  → status_cd=ON
+                "已上市" → status_cd=OK
+                "预案"   → progress_full LIKE '%预案%'
+                "股东大会" → progress_full LIKE '%大会通过%'
+                "受理"   → progress_full LIKE '%受理%'
+                "上市委" → progress_full LIKE '%上市委通过%'
+                "注册"   → progress_full LIKE '%注册%'
+                "申购"   → progress_full LIKE '%申购%'
+            status_cd: ON / OK
+            cb_type: 可转债 / 可交换债
+            limit: 返回数量限制，0=不限
+
+        Returns:
+            按对应阶段的里程碑日期倒序排列
+        """
+        conditions: list = []
+        params: list = []
+
+        if phase:
+            phase_map = {
+                '待发': "status_cd = 'ON'",
+                '已上市': "status_cd = 'OK'",
+                '预案': "progress_full LIKE '%预案%'",
+                '股东大会': "progress_full LIKE '%大会通过%'",
+                '受理': "progress_full LIKE '%受理%'",
+                '上市委': "progress_full LIKE '%上市委通过%'",
+                '注册': "progress_full LIKE '%注册%'",
+                '申购': "progress_full LIKE '%申购%'",
+            }
+            if phase in phase_map:
+                conditions.append(phase_map[phase])
+
+        if status_cd:
+            conditions.append('status_cd = ?')
+            params.append(status_cd)
+
+        if cb_type:
+            conditions.append('cb_type = ?')
+            params.append(cb_type)
+
+        where = (' WHERE ' + ' AND '.join(conditions)) if conditions else ''
+        query = f'SELECT * FROM jisilu_bonds{where}'
+
+        with self._get_conn() as conn:
+            cursor = conn.execute(query, params)
+            rows = cursor.fetchall()
+
+        # 标准化字段名（与 BondDataSource / get_latest_jisilu_data 格式一致）
+        result = []
+        for row in rows:
+            d = dict(row)
+            r = {
+                'bond_code': d.get('bond_id', ''),
+                'bond_name': d.get('bond_nm') or d.get('stock_nm') or '',
+                'stock_code': d.get('stock_code', ''),
+                'stock_name': d.get('stock_nm', ''),
+                'apply_date': d.get('apply_date', ''),
+                'apply_code': d.get('apply_cd', ''),
+                'ration_code': d.get('ration_cd', ''),
+                'record_date': d.get('record_dt', ''),
+                'record_price': d.get('record_price', 0),
+                'per_share_amount': d.get('ration', 0),
+                'issue_amount': d.get('amount', 0),
+                'convert_price': d.get('convert_price', 0),
+                'credit_rating': d.get('rating_cd', ''),
+                'progress': d.get('progress_nm', ''),
+                'progress_full': d.get('progress_full', ''),
+                'status': d.get('status_cd', ''),
+                'status_cd': d.get('status_cd', ''),
+                'cb_type': d.get('cb_type', ''),
+                'cb_flag': d.get('cb_flag', ''),
+                'list_date': d.get('list_date', ''),
+                'ap_flag': d.get('ap_flag', ''),
+                'price': d.get('price', 0),
+                'fetched_at': d.get('fetched_at', ''),
+            }
+            result.append(r)
+
+        # 排序：优先使用 phase 对应的里程碑日期（从 progress_full 提取）
+        # fallback 到 progress_dt → fetched_at
+        phase_milestone = {
+            '预案': '董事会预案',
+            '股东大会': '股东大会通过',
+            '受理': '受理',
+            '上市委': '上市委通过',
+            '注册': '同意注册',
+            '申购': '申购',
+        }
+        milestone = phase_milestone.get(phase)
+
+        def _parse_date(text: str, keyword: str) -> str:
+            """从 progress_full 文本中提取匹配关键词的日期"""
+            if not text:
+                return ''
+            text = text.replace('<br>', '\n')
+            for line in text.split('\n'):
+                if keyword in line:
+                    m = re.search(r'(\d{4}-\d{2}-\d{2})', line)
+                    if m:
+                        return m.group(1)
+            return ''
+
+        def sort_key(r):
+            if milestone:
+                d = _parse_date(r.get('progress_full', ''), milestone)
+                if d:
+                    return d
+            # fallback: progress_dt → fetched_at
+            return r.get('progress_dt', '') or r.get('fetched_at', '') or ''
+
+        result.sort(key=sort_key, reverse=True)
+
+        if limit > 0:
+            result = result[:limit]
+        return result
     # K 线数据
     # ============================================================
 
@@ -494,7 +757,7 @@ class BacktestCache:
             ''', (stock_code, days))
             rows = cursor.fetchall()
 
-        if not rows or len(rows) < min(days, 60):
+        if not rows or len(rows) < min(days, 150):
             # 缓存数据不足，从 API 补充
             self.fetch_and_save_kline(stock_code, days=days)
             with self._get_conn() as conn:

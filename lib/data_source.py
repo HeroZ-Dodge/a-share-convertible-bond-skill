@@ -295,29 +295,19 @@ class EastmoneyAPI:
 
         Args:
             stock_code: 6位股票代码
-            start_date: 起始日期 YYYY-MM-DD
-            end_date: 结束日期 YYYY-MM-DD
-            days: 获取天数（当 start_date 为 None 时生效）
+            days: 获取最近N个交易日的数据
 
         Returns:
             [{date, margin_balance, short_balance, total_margin,
               margin_buy_amount, margin_net_inflow, change_pct}, ...]
         """
-        from datetime import datetime as dt
-        if not start_date:
-            end = dt.now()
-            start = end - timedelta(days=days + 30)
-            start_date = start.strftime('%Y-%m-%d')
-        if not end_date:
-            end_date = dt.now().strftime('%Y-%m-%d')
-
         url = (
             "https://datacenter-web.eastmoney.com/api/data/v1/get?"
             "reportName=RPTA_WEB_RZRQ_GGMX&"
             "columns=DATE,SCODE,SECNAME,RZYE,RQYL,RZRQYE,RQYE,RZMRE,ZDF,RZRQYECZ&"
-            f"filter=(SCODE=\"{stock_code}\")(DATE>='{start_date}')(DATE<='{end_date}')&"
+            f"filter=(SCODE=%22{stock_code}%22)&"
             "sortColumns=DATE&sortTypes=-1&"
-            "pageNumber=1&pageSize=100&"
+            "pageNumber=1&pageSize=120&"
             "source=WEB&client=WEB"
         )
 
@@ -350,28 +340,18 @@ class EastmoneyAPI:
 
         Args:
             stock_code: 6位股票代码
-            start_date: 起始日期 YYYY-MM-DD
-            end_date: 结束日期 YYYY-MM-DD
             days: 获取天数
 
         Returns:
             [{date, deal_price, close_price, premium_ratio,
               deal_volume, deal_amount, buyer_name, seller_name}, ...]
         """
-        from datetime import datetime as dt
-        if not start_date:
-            end = dt.now()
-            start = end - timedelta(days=days + 30)
-            start_date = start.strftime('%Y-%m-%d')
-        if not end_date:
-            end_date = dt.now().strftime('%Y-%m-%d')
-
         url = (
             "https://datacenter-web.eastmoney.com/api/data/v1/get?"
             "reportName=RPT_DATA_BLOCKTRADE&"
             "columns=TRADE_DATE,SECURITY_CODE,SECURITY_NAME_ABBR,DEAL_PRICE,CLOSE_PRICE,"
             "PREMIUM_RATIO,DEAL_VOLUME,DEAL_AMT,BUYER_NAME,SELLER_NAME&"
-            f"filter=(SECURITY_CODE=\"{stock_code}\")(TRADE_DATE>='{start_date}')(TRADE_DATE<='{end_date}')&"
+            f"filter=(SECURITY_CODE=%22{stock_code}%22)&"
             "sortColumns=TRADE_DATE&sortTypes=-1&"
             "pageNumber=1&pageSize=100&"
             "source=WEB&client=WEB"
@@ -416,7 +396,7 @@ class EastmoneyAPI:
             "reportName=RPT_HOLDERNUM_DET&"
             "columns=END_DATE,SECURITY_CODE,SECURITY_SHORT_NAME,HOLDER_NUM,"
             "PRE_HOLDER_NUM,HOLDER_NUM_CHANGE,HOLDER_NUM_RATIO,INTERVAL_CHRATE&"
-            f"filter=(SECURITY_CODE=\"{stock_code}\")&"
+            f"filter=(SECURITY_CODE=%22{stock_code}%22)&"
             "sortColumns=END_DATE&sortTypes=-1&"
             "pageNumber=1&pageSize=20&"
             "source=WEB&client=WEB"
@@ -453,20 +433,12 @@ class EastmoneyAPI:
         Returns:
             [{date, receive_object, investors, num, survey_type}, ...]
         """
-        from datetime import datetime as dt
-        if days <= 0:
-            days = 180
-        start = dt.now() - timedelta(days=days + 30)
-        start_date = start.strftime('%Y-%m-%d')
-        end_date = dt.now().strftime('%Y-%m-%d')
-
         url = (
             "https://datacenter-web.eastmoney.com/api/data/v1/get?"
             "reportName=RPT_ORG_SURVEYNEW&"
             "columns=NOTICE_DATE,SECURITY_CODE,SECURITY_NAME_ABBR,"
             "RECEIVE_OBJECT,INVESTIGATORS,NUM,SUM,RECEIVE_WAY_EXPLAIN&"
-            f"filter=(SECURITY_CODE=\"{stock_code}\")(NOTICE_DATE>='{start_date}')"
-            f"(NOTICE_DATE<='{end_date}')&"
+            f"filter=(SECURITY_CODE=%22{stock_code}%22)&"
             "sortColumns=NOTICE_DATE&sortTypes=-1&"
             "pageNumber=1&pageSize=100&"
             "source=WEB&client=WEB"
@@ -510,7 +482,7 @@ class EastmoneyAPI:
             "columns=TRADE_DATE,SECURITY_CODE,SECURITY_SHORT_NAME,"
             "HOLD_SHARES,HOLD_SHARES_RATIO,SHARE_CHANGE,ADD_MARKET_CAP,"
             "HOLD_MARKET_CAP,FREE_SHARES_RATIO&"
-            f"filter=(SECURITY_CODE=\"{stock_code}\")&"
+            f"filter=(SECURITY_CODE=%22{stock_code}%22)&"
             "sortColumns=TRADE_DATE&sortTypes=-1&"
             "pageNumber=1&pageSize=100&"
             "source=WEB&client=WEB"
