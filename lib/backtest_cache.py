@@ -24,6 +24,12 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 
+# 交易日历缓存：30分钟内复用同一结果，避免频繁调API
+_latest_trade_date_cache: Dict[str, Any] = {'time': 0, 'date': ''}
+
+# 单只股票 K 线刷新缓存：30分钟内不重复刷新同一只股票，大幅减少API调用
+_kline_refresh_cache: Dict[str, float] = {}  # {stock_code: last_refresh_time}
+
 
 class BacktestCache:
     """回测缓存数据库管理"""
@@ -679,7 +685,7 @@ class BacktestCache:
 
     def fetch_and_save_kline(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
         """
-        从东方财富获取日 K 线并缓存（失败时降级到新浪财经）
+        从新浪财经获取日 K 线并缓存（失败时降级到东方财富）
 
         Args:
             stock_code: 6位股票代码
@@ -688,18 +694,14 @@ class BacktestCache:
         Returns:
             K 线数据列表
         """
-        from lib.data_source import EastmoneyAPI, SinaFinanceAPI
+        from lib.data_source import SinaFinanceAPI, EastmoneyAPI
 
         klines = []
 
-        # 尝试东方财富
-        em = EastmoneyAPI(timeout=15)
-        klines = em.fetch_stock_kline(stock_code, days=days)
-
-        # 降级到新浪财经
-        if not klines:
-            sina = SinaFinanceAPI(timeout=20)
-            prices = sina.fetch_history(stock_code, days=days)
+        # 优先新浪财经（稳定、无 SSL 断连问题）
+        sina = SinaFinanceAPI(timeout=20)
+        prices = sina.fetch_history(stock_code, days=days)
+        if prices:
             for date, data in sorted(prices.items()):
                 klines.append({
                     'date': date,
@@ -714,6 +716,13 @@ class BacktestCache:
                     'change_amount': 0,
                     'turnover_rate': 0,
                 })
+
+        # 降级到东方财富
+        if not klines:
+            em = EastmoneyAPI(timeout=15)
+            em_klines = em.fetch_stock_kline(stock_code, days=days)
+            if em_klines:
+                klines = em_klines
 
         if not klines:
             return []
@@ -737,13 +746,59 @@ class BacktestCache:
 
         return klines
 
-    def get_kline_as_dict(self, stock_code: str, days: int = 90) -> Dict[str, Dict[str, float]]:
+    def _query_kline(self, conn, stock_code: str, days: int):
+        """查询 K 线数据"""
+        if conn is None:
+            with self._get_conn() as c:
+                return self._query_kline(c, stock_code, days)
+        cursor = conn.execute('''
+            SELECT * FROM eastmoney_kline
+            WHERE stock_code = ?
+            ORDER BY trade_date DESC
+            LIMIT ?
+        ''', (stock_code, days))
+        return cursor.fetchall()
+
+    def _get_latest_trading_date(self) -> str:
+        """获取最新交易日（通过新浪财经API，不依赖本地缓存）
+
+        同一会话内30分钟复用，避免频繁调API。
+        """
+        global _latest_trade_date_cache
+        now = time.time()
+        if _latest_trade_date_cache['time'] and now - _latest_trade_date_cache['time'] < 1800:
+            return _latest_trade_date_cache['date']
+
+        from lib.data_source import SinaFinanceAPI
+        sina = SinaFinanceAPI(timeout=15)
+        prices = sina.fetch_history('000001', days=10)
+        if prices:
+            result = sorted(prices.keys())[-1]
+            _latest_trade_date_cache = {'time': now, 'date': result}
+            return result
+
+        # API 失败时降级：从缓存中取最新日期
+        with self._get_conn() as conn:
+            row = conn.execute('''
+                SELECT trade_date FROM eastmoney_kline
+                ORDER BY trade_date DESC LIMIT 1
+            ''').fetchone()
+        result = row['trade_date'] if row else ''
+        _latest_trade_date_cache = {'time': now, 'date': result}
+        return result
+
+    def get_kline_as_dict(self, stock_code: str, days: int = 90, skip_freshness_check: bool = False) -> Dict[str, Dict[str, float]]:
         """
         获取 K 线数据并转换为 {date: {open, close, ...}} 格式，兼容现有脚本
 
         Args:
             stock_code: 6位股票代码
             days: 获取天数
+            skip_freshness_check: 跳过缓存过期检查（回测不需要最新数据）
+
+        缓存策略:
+            - 回测: skip_freshness_check=True，完全跳过过期检查
+            - 监控: 交易日历缓存30分钟，单只股票30分钟内不重复刷新
 
         Returns:
             {date: {open, close, high, low, volume, amount, amplitude, change_pct, change_amount, turnover_rate}}
@@ -757,17 +812,27 @@ class BacktestCache:
             ''', (stock_code, days))
             rows = cursor.fetchall()
 
+        global _kline_refresh_cache
+        now_ts = time.time()
+
         if not rows or len(rows) < min(days, 150):
-            # 缓存数据不足，从 API 补充
-            self.fetch_and_save_kline(stock_code, days=days)
-            with self._get_conn() as conn:
-                cursor = conn.execute('''
-                    SELECT * FROM eastmoney_kline
-                    WHERE stock_code = ?
-                    ORDER BY trade_date DESC
-                    LIMIT ?
-                ''', (stock_code, days))
-                rows = cursor.fetchall()
+            # 缓存数据不足，从 API 补充（30分钟内不重复刷新同一只）
+            last_refresh = _kline_refresh_cache.get(stock_code, 0)
+            if now_ts - last_refresh > 1800:
+                self.fetch_and_save_kline(stock_code, days=days)
+                _kline_refresh_cache[stock_code] = now_ts
+            rows = self._query_kline(None, stock_code, days)
+
+        # 缓存过期检查：基于真实交易日历推断，不用启发式阈值
+        if not skip_freshness_check and rows:
+            last_cached = rows[0]['trade_date']
+            latest = self._get_latest_trading_date()
+            if latest and last_cached < latest:
+                last_refresh = _kline_refresh_cache.get(stock_code, 0)
+                if now_ts - last_refresh > 1800:
+                    self.fetch_and_save_kline(stock_code, days=days)
+                    _kline_refresh_cache[stock_code] = now_ts
+                rows = self._query_kline(None, stock_code, days)
 
         result = {}
         for row in reversed(rows):

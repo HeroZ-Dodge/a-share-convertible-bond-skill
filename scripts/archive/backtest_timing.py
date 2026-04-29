@@ -123,10 +123,10 @@ def get_stock_daily_data(stock_code: str, reg_date: str,
     if len(sorted_dates) < 10:
         return None
 
-    # 找到注册日对应的交易日索引
+    # 找到注册日对应的交易日索引（周末注册→映射到上周五，用 d<=target 避免错到下周一）
     reg_idx = None
-    for i, d in enumerate(sorted_dates):
-        if d >= reg_date:
+    for i in range(len(sorted_dates) - 1, -1, -1):
+        if sorted_dates[i] <= reg_date:
             reg_idx = i
             break
 

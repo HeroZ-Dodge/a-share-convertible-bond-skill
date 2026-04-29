@@ -84,6 +84,36 @@ class EastmoneyAPI:
             return '1'
         return '0'
 
+    # ==================== 交易日历 ====================
+
+    def fetch_trading_dates(self, days: int = 10) -> List[str]:
+        """获取最近交易日列表（通过上证指数K线推断）
+
+        Args:
+            days: 请求的K线条数（实际交易日数会略少，因包含非交易日空档）
+
+        Returns:
+            交易日列表，从旧到新排列 ['2026-04-20', '2026-04-21', ...]
+        """
+        url = (
+            f"https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+            f"secid=1.000001&"
+            f"fields1=f1,f2,f3,f4,f5,f6&"
+            f"fields2=f51&"
+            f"klt=101&fqt=1&"
+            f"lmt={days}"
+        )
+        data = self._request(url)
+        if not data or not data.get('data') or not data['data'].get('klines'):
+            return []
+        dates = []
+        for line in data['data']['klines']:
+            parts = line.split(',')
+            if parts:
+                dates.append(parts[0])
+        dates.sort()
+        return dates
+
     # ==================== K 线数据 ====================
 
     def fetch_stock_kline(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:

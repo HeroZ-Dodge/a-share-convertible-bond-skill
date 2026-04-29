@@ -18,6 +18,8 @@
 数据库:
   --sync-db  将理论信号写入 monitor.db（theory_signals 表）
   --compare CODE  查看某只股票的理论 vs 实际对比
+  --buy CODE DATE PRICE [REG_DATE]   记录实际买入
+  --sell CODE DATE PRICE [REG_DATE]  记录实际卖出
 
 回测模式:
   --backtest              6个策略独立回测 (L=100/150/200)
@@ -52,6 +54,7 @@ def calc_factors(cache, sc, anchor):
     if not prices:
         return None
     sd = sorted(prices.keys())
+    today_str = datetime.now().strftime('%Y-%m-%d')
     ri = find_idx(sd, anchor)
     reg = prices[sd[ri]]
     reg_close = reg['close']
@@ -88,7 +91,6 @@ def calc_factors(cache, sc, anchor):
         buy_price = prices[sd[buy_idx]].get('open', 0)
 
     # Current
-    today_str = datetime.now().strftime('%Y-%m-%d')
     latest_idx = find_idx(sd, today_str)
     if latest_idx < len(sd) and sd[latest_idx] <= today_str:
         current_close = prices[sd[latest_idx]].get('close', 0)
@@ -156,7 +158,7 @@ def build_pool(cache):
         if not anchor or anchor > today_str:
             continue
 
-        prices = cache.get_kline_as_dict(sc, days=1500)
+        prices = cache.get_kline_as_dict(sc, days=1500, skip_freshness_check=True)
         if not prices:
             continue
         sd = sorted(prices.keys())
@@ -924,13 +926,14 @@ def mode_compare(cache, stock_code):
 
     if actual:
         print(f"\n  📊 实际操作:")
-        print(f"    买入日: {actual.get('actual_buy_date', '--')}")
-        print(f"    买入价: {actual.get('actual_buy_price', '--')}")
-        print(f"    卖出日: {actual.get('actual_sell_date', '--')}")
-        print(f"    卖出价: {actual.get('actual_sell_price', '--')}")
-        print(f"    持仓天数: {actual.get('hold_days', '--')}")
-        print(f"    实际收益: {actual.get('return_pct', '--'):+.2f}%")
-        print(f"    状态: {actual.get('status', '--')}")
+        print(f"    买入日: {actual.get('actual_buy_date') or '--'}")
+        print(f"    买入价: {actual.get('actual_buy_price') or '--'}")
+        print(f"    卖出日: {actual.get('actual_sell_date') or '--'}")
+        print(f"    卖出价: {actual.get('actual_sell_price') or '--'}")
+        print(f"    持仓天数: {actual.get('hold_days') or '--'}")
+        rp = actual.get('return_pct')
+        print(f"    实际收益: {rp:+.2f}%" if rp is not None else "    实际收益: --")
+        print(f"    状态: {actual.get('status') or '--'}")
 
     if comparison:
         print(f"\n  📊 对比:")
@@ -953,6 +956,8 @@ def main():
     disable_keys = []
     is_sync_db = False
     compare_code = None
+    buy_cmd = None   # (code, date, price, reg_date?)
+    sell_cmd = None  # (code, date, price, reg_date?)
 
     i = 0
     while i < len(args):
@@ -983,6 +988,20 @@ def main():
         elif args[i] == '--compare' and i + 1 < len(args):
             compare_code = args[i+1]
             i += 2
+        elif args[i] == '--buy' and i + 3 < len(args):
+            code = args[i+1]
+            date = args[i+2]
+            price = float(args[i+3])
+            reg_date = args[i+4] if i + 4 < len(args) and not args[i+4].startswith('--') else None
+            buy_cmd = (code, date, price, reg_date)
+            i += 4 + (1 if reg_date else 0)
+        elif args[i] == '--sell' and i + 3 < len(args):
+            code = args[i+1]
+            date = args[i+2]
+            price = float(args[i+3])
+            reg_date = args[i+4] if i + 4 < len(args) and not args[i+4].startswith('--') else None
+            sell_cmd = (code, date, price, reg_date)
+            i += 4 + (1 if reg_date else 0)
         else:
             i += 1
 
@@ -1005,6 +1024,32 @@ def main():
 
     if compare_code:
         mode_compare(cache, compare_code)
+        return
+
+    if buy_cmd:
+        code, date, price, reg_date = buy_cmd
+        # 从注册事件查名称
+        name = ''
+        if reg_date:
+            with db._get_conn() as conn:
+                row = conn.execute(
+                    "SELECT stock_name FROM registration_events WHERE stock_code=? AND registration_date=?",
+                    (code, reg_date)
+                ).fetchone()
+                if row:
+                    name = (row['stock_name'] or '')[:12]
+        db.record_actual_buy(stock_code=code, buy_date=date, buy_price=price,
+                             registration_date=reg_date, stock_name=name)
+        print(f"已记录买入: {name or code}({code}) 买价={price:.2f} 日期={date}"
+              + (f" 注册日={reg_date}" if reg_date else ""))
+        return
+
+    if sell_cmd:
+        code, date, price, reg_date = sell_cmd
+        result = db.record_actual_sell(stock_code=code, sell_date=date, sell_price=price,
+                                       registration_date=reg_date)
+        ret = result.get('return_pct', 0)
+        print(f"已记录卖出: {code} 卖价={price:.2f} 日期={date} 收益={ret:+.2f}%")
         return
 
     if mode == '--scan':

@@ -136,6 +136,19 @@ _VERIFIED = [
              display_name='回调结束企稳',
              condition=lambda f: f['pre3'] <= -1.5 and f['consec_down'] <= 1,
              best_exit='TP5/SL5', sharpe='+0.40'),
+
+]
+
+# 注册前信号策略（需 mom20 因子，独立于预注册监控脚本中运行）
+_PRE_REG = [
+    Strategy('pre_deep_pullback', 'pre3<=-2+mom20<=-3+vol<=0.8',
+             display_name='注册前·深调缩量',
+             condition=lambda f: f['pre3'] <= -2 and f['mom20'] <= -3 and f.get('vol_ratio', f.get('vol_ratio5', 1)) <= 0.8,
+             best_exit='D+1', sharpe='+0.35'),
+    Strategy('pre_wide_shrink', 'pre3<=1+mom20<=-5+vol<=0.8',
+             display_name='注册前·宽幅缩量',
+             condition=lambda f: f['pre3'] <= 1 and f['mom20'] <= -5 and f.get('vol_ratio', f.get('vol_ratio5', 1)) <= 0.8,
+             best_exit='D+1', sharpe='+0.40'),
 ]
 
 
@@ -148,3 +161,6 @@ def _register_defaults():
 # 全局实例
 registry = StrategyRegistry()
 _register_defaults()
+
+# 已淘汰策略（夏普过低，无预测力）
+registry.disable(['broad_momentum'])
