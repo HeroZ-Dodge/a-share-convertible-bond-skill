@@ -38,6 +38,28 @@ from lib.strategies import registry
 from lib.monitor_db import MonitorDB
 
 
+def _dw(s):
+    """Display width (CJK chars = 2 cols)"""
+    return sum(2 if '一' <= c <= '鿿' else 1 for c in str(s))
+
+
+def _pad(s, width, left=True):
+    """Pad/truncate string to target display width"""
+    s = str(s)
+    dw = _dw(s)
+    if dw >= width:
+        result, used = '', 0
+        for c in s:
+            cw = 2 if '一' <= c <= '鿿' else 1
+            if used + cw > width:
+                break
+            result += c
+            used += cw
+        return result + ' ' * (width - used)
+    padding = width - dw
+    return (s + ' ' * padding) if left else (' ' * padding + s)
+
+
 def find_idx(sd, target):
     result = 0
     for i, d in enumerate(sd):
@@ -380,8 +402,9 @@ def mode_backtest(cache, combo_mode=None):
 
         for mode in modes:
             print(f"\n  {combo_label(mode)}:")
-            print(f"  {'Limit':<10} {'样本':>4} {'平均':>7} {'胜率':>6} {'夏普':>6} {'持有':>5} {'年化':>8}")
-            print("  " + "-" * 60)
+            hdr = f"  {_pad('Limit', 10)} {_pad('样本', 4)} {_pad('平均', 7)} {_pad('胜率', 6)} {_pad('夏普', 6)} {_pad('持有', 5)} {_pad('年化', 8)}"
+            print(hdr)
+            print("  " + "-" * (_dw(hdr) - 2))
 
             for limit in [100, 150, 200, 0]:
                 pl = pool[:limit] if limit else pool
@@ -401,9 +424,15 @@ def mode_backtest(cache, combo_mode=None):
         print(f"  独立策略回测 (D+9 固定退出)")
         print(f"{'-'*110}")
 
-        print(f"\n  {'策略':<42} {'L=100':>14} {'L=150':>14} {'L=200':>14} {'全量':>14}")
-        print(f"  {'':42} {'n avg sh':>14} {'n avg sh':>14} {'n avg sh':>14} {'n avg sh':>14}")
-        print("  " + "-" * 80)
+        hdr = f"  {_pad('策略', 42)}"
+        for lim in ['L=100', 'L=150', 'L=200', '全量']:
+            hdr += f" {_pad(lim, 20)}"
+        print(hdr)
+        sub = f"  {_pad('', 42)}"
+        for _ in range(4):
+            sub += f" {_pad('n avg sh', 20)}"
+        print(sub)
+        print("  " + "-" * (_dw(hdr) - 2))
 
         for key in registry.active_keys():
             parts = []
@@ -411,18 +440,25 @@ def mode_backtest(cache, combo_mode=None):
                 pl = pool[:limit] if limit else pool
                 d9, tp = run_backtest_single(pl, key)
                 if d9:
-                    parts.append(f"{d9['n']:>3} {d9['avg']:>+4.1f}% sh={d9['sharpe']:+.2f}")
+                    val = f"{d9['n']} {d9['avg']:+.1f}% sh={d9['sharpe']:+.2f}"
+                    parts.append(_pad(val, 20))
                 else:
-                    parts.append("        --")
-            print(f"  {_display_name(key):<42} {parts[0]:>14} {parts[1]:>14} {parts[2]:>14} {parts[3]:>14}")
+                    parts.append(_pad('--', 20))
+            print(f"  {_pad(_display_name(key), 42)} {' '.join(parts)}")
 
         print(f"\n" + "-" * 110)
         print(f"  独立策略回测 (TP5/SL5 动态退出)")
         print(f"{'-'*110}")
 
-        print(f"\n  {'策略':<42} {'L=100':>22} {'L=150':>22} {'L=200':>22} {'全量':>22}")
-        print(f"  {'':42} {'n avg sh eff':>22} {'n avg sh eff':>22} {'n avg sh eff':>22} {'n avg sh eff':>22}")
-        print("  " + "-" * 115)
+        hdr = f"  {_pad('策略', 42)}"
+        for lim in ['L=100', 'L=150', 'L=200', '全量']:
+            hdr += f" {_pad(lim, 30)}"
+        print(hdr)
+        sub = f"  {_pad('', 42)}"
+        for _ in range(4):
+            sub += f" {_pad('n avg sh eff', 30)}"
+        print(sub)
+        print("  " + "-" * (_dw(hdr) - 2))
 
         for key in registry.active_keys():
             parts = []
@@ -431,18 +467,22 @@ def mode_backtest(cache, combo_mode=None):
                 d9, tp = run_backtest_single(pl, key)
                 if tp:
                     eff = tp['avg'] / tp['avg_hold'] * 245 if tp['avg_hold'] > 0 else 0
-                    parts.append(f"{tp['n']:>3} {tp['avg']:>+4.1f}% sh={tp['sharpe']:+.2f} eff={eff:+.0f}%")
+                    val = f"{tp['n']} {tp['avg']:+.1f}% sh={tp['sharpe']:+.2f} eff={eff:+.0f}%"
+                    parts.append(_pad(val, 30))
                 else:
-                    parts.append("            --")
-            print(f"  {_display_name(key):<42} {parts[0]:>22} {parts[1]:>22} {parts[2]:>22} {parts[3]:>22}")
+                    parts.append(_pad('--', 30))
+            print(f"  {_pad(_display_name(key), 42)} {' '.join(parts)}")
 
         # 稳定性总结
         print(f"\n" + "-" * 110)
         print(f"  稳定性总结 (TP5/SL5夏普趋势)")
         print(f"{'-'*110}")
 
-        print(f"\n  {'策略':<42} {'L=100':>8} {'L=150':>8} {'L=200':>8} {'全量':>8} {'趋势':>10}")
-        print("  " + "-" * 90)
+        hdr = f"  {_pad('策略', 42)}"
+        for lim in ['L=100', 'L=150', 'L=200', '全量', '趋势']:
+            hdr += f" {_pad(lim, 10)}"
+        print(hdr)
+        print("  " + "-" * (_dw(hdr) - 2))
 
         for key in registry.active_keys():
             shards = []
@@ -453,10 +493,11 @@ def mode_backtest(cache, combo_mode=None):
             if all(x is not None for x in shards):
                 diff = shards[-1] - shards[0]
                 trend = '→稳定' if abs(diff) < 0.2 else '→衰减' if diff < -0.2 else '→上升'
-                parts_s = [f'{x:+.2f}' for x in shards]
+                parts_s = [_pad(f'{x:+.2f}', 10) for x in shards]
             else:
-                trend = '???'; parts_s = [f'{x:+.2f}' if x else '--' for x in shards]
-            print(f"  {_display_name(key):<42} {parts_s[0]:>8} {parts_s[1]:>8} {parts_s[2]:>8} {parts_s[3]:>8} {trend:>10}")
+                trend = '???'; parts_s = [_pad(f'{x:+.2f}' if x else '--', 10) for x in shards]
+            parts_s.append(_pad(trend, 10))
+            print(f"  {_pad(_display_name(key), 42)} {' '.join(parts_s)}")
 
     # 年份分组（只对L=200和全量）
     print(f"\n" + "-" * 110)
@@ -467,8 +508,9 @@ def mode_backtest(cache, combo_mode=None):
     for key in registry.active_keys():
         s_cond = registry.get(key).condition
         print(f"\n  {_display_name(key)}:")
-        print(f"    {'年份':<8} {'样本':>4} {'平均':>7} {'胜率':>6} {'夏普':>6} {'年化':>8}")
-        print("    " + "-" * 50)
+        hdr = f"    {_pad('年份', 8)} {_pad('样本', 4)} {_pad('平均', 7)} {_pad('胜率', 6)} {_pad('夏普', 6)} {_pad('年化', 8)}"
+        print(hdr)
+        print("    " + "-" * (_dw(hdr) - 4))
         for year in ['2023', '2024', '2025', '2026']:
             yr_pool = [s for s in pool_200 if s['anchor'].startswith(year) and s_cond(s['factors'])]
             if not yr_pool:
@@ -476,9 +518,9 @@ def mode_backtest(cache, combo_mode=None):
             tp = test_tp5_sl5_exit(yr_pool)
             if tp and tp['n'] >= 2:
                 eff = tp['avg'] / tp['avg_hold'] * 245 if tp['avg_hold'] > 0 else 0
-                print(f"    {year}年 {tp['n']:>4} {tp['avg']:>+6.2f}% {tp['win']:>5.1f}% {tp['sharpe']:>+5.2f} {eff:>+7.1f}%")
+                print(f"    {_pad(year + '年', 8)} {_pad(str(tp['n']), 4)} {tp['avg']:>+6.2f}% {tp['win']:>5.1f}% {tp['sharpe']:>+5.2f} {eff:>+7.1f}%")
             elif tp:
-                print(f"    {year}年 {tp['n']:>4} (样本不足)")
+                print(f"    {_pad(year + '年', 8)} {_pad(str(tp['n']), 4)} (样本不足)")
 
 
 # ========== 数据池构建（监控用 — 复用 build_pool） ==========
@@ -641,8 +683,9 @@ def mode_combo(cache):
         return
 
     print(f"\n  组合信号 ({len(triggered)}只):")
-    print(f"  {'名称':<12} {'代码':>8} {'注册日':<12} {'天数':>4} {'策略数':>4} {'触发策略':>50} {'盈亏'}")
-    print("  " + "-" * 105)
+    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} {_pad('天数', 6)} {_pad('策略数', 6)} {_pad('触发策略', 30)} 盈亏"
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
 
     # 买入信号优先
     buy = [r for r in triggered if r['calendar_diff'] <= 1]
@@ -656,8 +699,8 @@ def mode_combo(cache):
             bp = f"{f['buy_price']:.2f}" if f['buy_price'] else '--'
             tags = print_strategy_tags(s['triggered'])
             d = s.get('days_since', s['calendar_diff'])
-            print(f"  {s['name']:<12} {s['code']:>8} {s['anchor']:<12} "
-                  f"T+{d:>3}  {active_hit_count(s['triggered'])}个策略  {tags:<48} 买价{bp}")
+            print(f"  {_pad(s['name'], 14)} {_pad(s['code'], 8)} {_pad(s['anchor'], 16)} "
+                  f"T+{d:>3}  {active_hit_count(s['triggered'])}个策略  {tags}")
 
     if hold:
         print(f"\n  📊 持仓:")
@@ -666,8 +709,8 @@ def mode_combo(cache):
             pnl = f"{f['pnl_pct']:+.1f}%" if f['pnl_pct'] is not None else '--'
             tags = print_strategy_tags(h['triggered'])
             d = h.get('days_since', h['calendar_diff'])
-            print(f"  {h['name']:<12} {h['code']:>8} {h['anchor']:<12} "
-                  f"T+{d:>3}  {active_hit_count(h['triggered'])}个策略  {tags:<48} {pnl}")
+            print(f"  {_pad(h['name'], 14)} {_pad(h['code'], 8)} {_pad(h['anchor'], 16)} "
+                  f"T+{d:>3}  {active_hit_count(h['triggered'])}个策略  {tags} {pnl}")
 
     if past:
         print(f"\n  已过退出期:")
@@ -676,8 +719,8 @@ def mode_combo(cache):
             pnl = f"{f['pnl_pct']:+.1f}%" if f['pnl_pct'] is not None else '--'
             tags = print_strategy_tags(p['triggered'])
             d = p.get('days_since', p['calendar_diff'])
-            print(f"  {p['name']:<12} {p['code']:>8} {p['anchor']:<12} "
-                  f"T+{d:>3}  {active_hit_count(p['triggered'])}个策略  {tags:<48} {pnl}")
+            print(f"  {_pad(p['name'], 14)} {_pad(p['code'], 8)} {_pad(p['anchor'], 16)} "
+                  f"T+{d:>3}  {active_hit_count(p['triggered'])}个策略  {tags} {pnl}")
 
 
 def mode_status(cache):
@@ -690,20 +733,20 @@ def mode_status(cache):
     print(f"{'='*110}")
 
     active = registry.active_keys()
-    col_w = max(5, max(len(_short_name(k))+1 for k in active)) if active else 6
-    header_cols = ' '.join(f"{_short_name(k):>{col_w}}" for k in active)
-    print(f"\n  {'名称':<12} {'代码':>8} {'注册日':<12} {'天数':>4}  {header_cols}  "
-          f"{'pre3':>7} {'mom10':>7} {'rc':>6} {'vol':>5}")
+    col_w = max(5, max(_dw(_short_name(k))+1 for k in active)) if active else 6
+    print(f"\n  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} {'天数':>6}  "
+          f"{''.join(_pad(_short_name(k), col_w) for k in active)}  "
+          f"{'pre3':>7} {'mom10':>8} {'rc':>6} {'vol':>5}")
     print("  " + "-" * 110)
 
     for r in results:
         f = r['factors']
         t = r['triggered']
-        cols = ' '.join(f"{'✅' if t.get(k) else '':>{col_w}}" for k in active)
+        cols = ' '.join(f"{'✅' if t.get(k) else '' :>{col_w}}" for k in active)
         d = r.get('days_since', r['calendar_diff'])
-        print(f"  {r['name']:<12} {r['code']:>8} {r['anchor']:<12} "
+        print(f"  {_pad(r['name'], 14)} {_pad(r['code'], 8)} {_pad(r['anchor'], 16)} "
               f"T+{d:>3}  {cols}  "
-              f"{f['pre3']:>+6.1f}% {f['mom10']:>+6.1f}% "
+              f"{f['pre3']:>+6.1f}% {f['mom10']:>+7.1f}% "
               f"{f['rc']:>+5.1f}% {f['vol_ratio5']:>5.2f}")
 
 
@@ -781,8 +824,9 @@ def mode_scan(cache):
         all_results = scan_registrations(cache)
         if all_results:
             print(f"\n  近期注册事件 ({len(all_results)}只，20天内):")
-            print(f"  {'名称':<12} {'代码':>8} {'注册日':<12} {'天数':>4} {'策略触发'}")
-            print("  " + "-" * 90)
+            hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} {'天数':>6} {'策略触发'}"
+            print(hdr)
+            print("  " + "-" * (_dw(hdr) - 2))
             for r in all_results[:10]:
                 tag = print_strategy_tags(r['triggered']) or '—'
                 f = r['factors']
@@ -804,7 +848,7 @@ def mode_scan(cache):
                     elif a.get('status') == 'closed':
                         actual_info = f" [已平仓]"
 
-                print(f"  {r['name']:<12} {r['code']:>8} {r['anchor']:<12} "
+                print(f"  {_pad(r['name'], 14)} {_pad(r['code'], 8)} {_pad(r['anchor'], 16)} "
                       f"T+{d:>3}  {tag}{actual_info}  "
                       f"pre3={f['pre3']:+.1f}% mom10={f['mom10']:+.1f}% "
                       f"rc={f['rc']:+.1f}% vol={f['vol_ratio5']:.2f}")
@@ -814,14 +858,15 @@ def mode_scan(cache):
     signals.sort(key=lambda x: active_hit_count(x['triggered']), reverse=True)
 
     print(f"\n  📢 买入信号 ({len(signals)}只, D+1开盘):")
-    print(f"  {'名称':<12} {'代码':>8} {'注册日':<12} {'买价':>8} {'触发策略':>50}")
-    print("  " + "-" * 95)
+    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} {_pad('买价', 8)} {'触发策略'}"
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
 
     for s in signals:
         f = s['factors']
         tags = print_strategy_tags(s['triggered'])
         bp = f"{s['factors']['buy_price']:.2f}" if s['factors']['buy_price'] else '--'
-        print(f"  {s['name']:<12} {s['code']:>8} {s['anchor']:<12} {bp:>8} {tags}")
+        print(f"  {_pad(s['name'], 14)} {_pad(s['code'], 8)} {_pad(s['anchor'], 16)} {_pad(bp, 8)} {tags}")
 
     # 按策略分组
     print(f"\n  按策略分组:")
@@ -841,8 +886,9 @@ def mode_hold(cache):
     today_str = datetime.now().strftime('%Y-%m-%d')
 
     print(f"\n  📊 持仓监控 ({len(holdings)}只):")
-    print(f"  {'名称':<12} {'代码':>8} {'持仓':>4} {'买价':>8} {'现价':>8} {'盈亏':>8} {'止盈止损':>6} {'触发策略'}")
-    print("  " + "-" * 100)
+    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {'持仓':>6} {_pad('买价', 8)} {_pad('现价', 8)} {_pad('盈亏', 8)} {'止盈止损':>10} {'触发策略'}"
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
 
     if not holdings:
         print(f"  无持仓")
@@ -889,8 +935,8 @@ def mode_hold(cache):
             elif a.get('status') == 'closed':
                 actual_info = f" |实际:已平仓"
 
-        print(f"  {h['name']:<12} {h['code']:>8} T+{display_days:>3} "
-              f"{bp:>8} {cp:>8} {pnl:>8} {exit_str:>8} {tags}{actual_info}")
+        print(f"  {_pad(h['name'], 14)} {_pad(h['code'], 8)} T+{display_days:>3} "
+              f"{bp:>8} {cp:>8} {pnl:>8} {exit_str:>10} {tags}{actual_info}")
 
 
 def mode_compare(cache, stock_code):

@@ -141,6 +141,29 @@ def calc_factors_at(closes, volumes, idx):
     }
 
 
+def _dw(s):
+    """Calculate display width (CJK chars = 2 cols)"""
+    return sum(2 if '一' <= c <= '鿿' else 1 for c in str(s))
+
+def _pad(s, width, left=True):
+    """Pad/truncate string to target display width"""
+    s = str(s)
+    dw = _dw(s)
+    if dw >= width:
+        result, used = '', 0
+        for c in s:
+            cw = 2 if '一' <= c <= '鿿' else 1
+            if used + cw > width:
+                break
+            result += c
+            used += cw
+        return result + ' ' * (width - used)
+    padding = width - dw
+    if left:
+        return s + ' ' * padding
+    else:
+        return ' ' * padding + s
+
 def parse_progress_full(text):
     """从 progress_full 解析上市委通过和同意注册日期"""
     tg_date, reg_date = '', ''
@@ -405,65 +428,89 @@ def print_backtest_report(pool, results, limit, strategies=None):
 
     # 策略对比 — 监控退出
     print(f'\n  策略对比 (监控退出: 发现同意注册后次日卖出)')
-    print(f'  {"策略":<12} {"样本":>5} {"平均%":>7} {"胜率":>6} {"标准差":>7} {"夏普":>6} {"持有":>5} {"年化":>7} {"距通过":>6}')
-    print("  " + "-" * 80)
+    hdr = f"  {_pad('策略', 14)} {_pad('样本', 5)} {_pad('平均%', 7)} {_pad('胜率', 7)} {_pad('标准差', 7)} {_pad('夏普', 7)} {_pad('持有', 7)} {_pad('年化', 9)} {_pad('距通过', 6)}"
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
     for key, r in sorted(results.items(), key=lambda x: x[1]['fixed']['sharpe'] if x[1]['fixed'] else 0, reverse=True):
         s = r['strategy']; fs = r['fixed']
         ann = fs['avg'] / fs['avg_hold'] * 245 if fs['avg_hold'] > 0 else 0
         avg_off = sum(t['offset_tongguo'] for t in pool if t.get('strategy_key') == key) / r['count'] if r['count'] > 0 else 0
-        print(f"  {s.display_name:<12} {fs['n']:>5} {fs['avg']:>+6.2f}% {fs['win']:>5.1f}% "
-              f"{fs['std']:>6.2f}% {fs['sharpe']:>+5.2f} {fs['avg_hold']:>4.1f}d "
-              f"{ann:>+6.1f}% D+{avg_off:.0f}")
+        p_name = s.display_name
+        p_n = str(fs['n'])
+        p_avg = f"{fs['avg']:+.1f}%"
+        p_win = f"{fs['win']:.1f}%"
+        p_std = f"{fs['std']:.1f}%"
+        p_sh = f"{fs['sharpe']:+.2f}"
+        p_hold = f"{fs['avg_hold']:.1f}d"
+        p_ann = f"{ann:+.1f}%"
+        p_off = f"D+{avg_off:.0f}"
+        print(f"  {_pad(p_name, 14)} {_pad(p_n, 5)} {_pad(p_avg, 7)} {_pad(p_win, 7)} {_pad(p_std, 7)} {_pad(p_sh, 7)} {_pad(p_hold, 7)} {_pad(p_ann, 9)} {_pad(p_off, 5)}")
 
     # 策略对比 — TP/SL
     print(f'\n  策略对比 (TP{TP}%/SL{SL}% 止盈止损)')
-    print(f'  {"策略":<12} {"样本":>5} {"平均%":>7} {"胜率":>6} {"标准差":>7} {"夏普":>6} {"持有":>5} {"年化":>7}')
-    print("  " + "-" * 75)
+    hdr = f"  {_pad('策略', 14)} {_pad('样本', 5)} {_pad('平均%', 7)} {_pad('胜率', 7)} {_pad('标准差', 7)} {_pad('夏普', 7)} {_pad('持有', 7)} {_pad('年化', 9)}"
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
     for key, r in sorted(results.items(), key=lambda x: x[1]['tp_sl']['sharpe'] if x[1]['tp_sl'] else 0, reverse=True):
         s = r['strategy']; ts = r['tp_sl']
         ann = ts['avg'] / ts['avg_hold'] * 245 if ts['avg_hold'] > 0 else 0
-        print(f"  {s.display_name:<12} {ts['n']:>5} {ts['avg']:>+6.2f}% {ts['win']:>5.1f}% "
-              f"{ts['std']:>6.2f}% {ts['sharpe']:>+5.2f} {ts['avg_hold']:>4.1f}d {ann:>+6.1f}%")
+        p_name = s.display_name
+        p_n = str(ts['n'])
+        p_avg = f"{ts['avg']:+.1f}%"
+        p_win = f"{ts['win']:.1f}%"
+        p_std = f"{ts['std']:.1f}%"
+        p_sh = f"{ts['sharpe']:+.2f}"
+        p_hold = f"{ts['avg_hold']:.1f}d"
+        p_ann = f"{ann:+.1f}%"
+        print(f"  {_pad(p_name, 14)} {_pad(p_n, 5)} {_pad(p_avg, 7)} {_pad(p_win, 7)} {_pad(p_std, 7)} {_pad(p_sh, 7)} {_pad(p_hold, 7)} {_pad(p_ann, 9)}")
 
     # 年份稳定性
     print(f'\n  年份稳定性 (TP{TP}%/SL{SL}%)')
-    print(f'  {"策略":<12} ', end='')
+    hdr = f"  {_pad('策略', 14)} "
     for yr in ['2023', '2024', '2025', '2026']:
-        print(f'{"":>3}{yr:>4} ', end='')
-    print()
-    print("  " + "-" * 60)
+        hdr += f"{_pad(yr, 9)} "
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
     for key, r in sorted(results.items()):
         s = r['strategy']
-        print(f"  {s.display_name:<12} ", end='')
+        row = f"  {_pad(s.display_name, 14)} "
         for yr in ['2023', '2024', '2025', '2026']:
             ys = r['by_year'].get(yr)
-            if ys and ys['n'] >= 2: print(f"{ys['n']:>3}{ys['avg']:>+3.0f}% ", end='')
-            elif ys: print(f"  {ys['n']:>2}* ", end='')
-            else: print(f"     -- ", end='')
-        print()
+            if ys and ys['n'] >= 2:
+                row += _pad(f"{ys['n']}{ys['avg']:+.0f}%", 9) + " "
+            elif ys:
+                row += _pad(f"{ys['n']}*", 9) + " "
+            else:
+                row += _pad('--', 9) + " "
+        print(row)
 
     # 收益分布
     print(f'\n  收益分布 (监控退出)')
-    print(f'  {"范围":>10} ', end='')
+    hdr = f"  {_pad('范围', 10)} "
     for key, r in results.items():
-        print(f"{r['strategy'].display_name:>12} ", end='')
-    print()
-    print("  " + "-" * (12 * len(results) + 15))
+        hdr += f"{_pad(r['strategy'].display_name, 14)} "
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
     for lbl, (lo, hi) in [('< -10%', (-999, -10)), ('-10~-5%', (-10, -5)),
                            ('-5~0%', (-5, 0)), ('0~5%', (0, 5)),
                            ('5~10%', (5, 10)), ('>10%', (10, 999))]:
-        print(f'  {lbl:>10} ', end='')
+        row = f"  {_pad(lbl, 10)} "
         for key, r in results.items():
             triggered = [t for t in pool if t.get('strategy_key') == key]
             c = sum(1 for t in triggered if lo <= t['ret'] < hi)
-            print(f"{c:>8}({c/len(triggered)*100:.0f}%) " if triggered else f"{'--':>8} ", end='')
-        print()
+            if triggered:
+                val = f"{c}({c/len(triggered)*100:.0f}%)"
+                row += _pad(val, 14) + " "
+            else:
+                row += _pad('--', 14) + " "
+        print(row)
 
     # 盈亏比
     print(f'\n  盈亏比分析 (监控退出)')
-    print(f'  {"策略":<12} {"盈利笔":>6} {"平均盈利":>8} {"最佳":>8} '
-          f'{"亏损笔":>6} {"平均亏损":>8} {"最差":>8} {"盈亏比":>6}')
-    print("  " + "-" * 75)
+    hdr = f"  {_pad('策略', 14)} {_pad('盈利笔', 6)} {_pad('平均盈利', 9)} {_pad('最佳', 9)} " \
+          f"{_pad('亏损笔', 6)} {_pad('平均亏损', 9)} {_pad('最差', 9)} {_pad('盈亏比', 6)}"
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
     for key, r in results.items():
         triggered = [t for t in pool if t.get('strategy_key') == key]
         wins = [t['ret'] for t in triggered if t['ret'] > 0]
@@ -471,39 +518,52 @@ def print_backtest_report(pool, results, limit, strategies=None):
         aw = sum(wins) / len(wins) if wins else 0
         al = sum(losses) / len(losses) if losses else 0
         wl = abs(aw / al) if al != 0 else 0
-        print(f"  {r['strategy'].display_name:<12} {len(wins):>6} {aw:>+7.2f}% {max(wins):>+7.2f}% "
-              f"{len(losses):>6} {al:>+7.2f}% {min(losses):>+7.2f}% {wl:>5.2f}")
+        p_name = r['strategy'].display_name
+        p_w = str(len(wins))
+        p_aw = f"{aw:+.1f}%"
+        p_mw = f"{max(wins):+.1f}%" if wins else '--'
+        p_l = str(len(losses))
+        p_al = f"{al:+.1f}%" if losses else '--'
+        p_ml = f"{min(losses):+.1f}%" if losses else '--'
+        p_wl = f"{wl:.2f}"
+        print(f"  {_pad(p_name, 14)} {_pad(p_w, 6)} {_pad(p_aw, 9)} {_pad(p_mw, 9)} {_pad(p_l, 6)} {_pad(p_al, 9)} {_pad(p_ml, 9)} {_pad(p_wl, 6)}")
 
     # 跨样本量对比
     print(f'\n  跨样本量对比 (每债券每策略独立条目)')
-    print(f'  {"策略":<12}', end='')
+    hdr = f"  {_pad('策略', 14)}"
     for lim in [50, 100, 150, 200]:
-        print(f'{"L=" + str(lim):>14}', end='')
-    print(f'{"全量":>14}')
-    print("  " + "-" * (12 + 14 * 5))
+        hdr += f" {_pad('L=' + str(lim), 14)}"
+    hdr += f" {_pad('全量', 14)}"
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
     for key, r in sorted(results.items(), key=lambda x: x[1]['fixed']['sharpe'] if x[1]['fixed'] else 0, reverse=True):
         s = r['strategy']
-        print(f"  {s.display_name:<12}", end='')
+        row = f"  {_pad(s.display_name, 14)}"
         for lim in [50, 100, 150, 200]:
             sub = pool[:lim]
             triggered_sub = [t for t in sub if t.get('strategy_key') == key]
             if len(triggered_sub) >= 2:
                 ss = calc_stats(triggered_sub)
-                print(f" N={ss['n']:>2} sh={ss['sharpe']:>+5.2f} w={ss['win']:>4.0f}%", end='')
+                val = f"N={ss['n']} sh={ss['sharpe']:+.2f} w={ss['win']:.0f}%"
+                row += f" {_pad(val, 14)}"
             else:
-                print(f" {'--':>14}", end='')
+                row += f" {_pad('--', 14)}"
         fs = r['fixed']
-        print(f" N={fs['n']:>2} sh={fs['sharpe']:>+5.2f} w={fs['win']:>4.0f}%")
+        val = f"N={fs['n']} sh={fs['sharpe']:+.2f} w={fs['win']:.0f}%"
+        row += f" {_pad(val, 14)}"
+        print(row)
 
     # 卖出类型分布
     print(f'\n  卖出类型分布')
-    print(f'  {"策略":<12} {"REG":>8} {"TP":>8} {"SL":>8}')
-    print("  " + "-" * 40)
+    hdr = f"  {_pad('策略', 14)} {_pad('REG', 9)} {_pad('TP', 9)} {_pad('SL', 9)}"
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
     for key, r in results.items():
         st = r.get('sell_types', {'REG': r['count']})
-        print(f"  {r['strategy'].display_name:<12} {st.get('REG', 0):>6}({st.get('REG', 0)/r['count']*100:.0f}%) "
-              f"{st.get('TP', 0):>6}({st.get('TP', 0)/r['count']*100:.0f}%) "
-              f"{st.get('SL', 0):>6}({st.get('SL', 0)/r['count']*100:.0f}%)")
+        reg_s = f"{st.get('REG', 0)}({st.get('REG', 0)/r['count']*100:.0f}%)"
+        tp_s = f"{st.get('TP', 0)}({st.get('TP', 0)/r['count']*100:.0f}%)"
+        sl_s = f"{st.get('SL', 0)}({st.get('SL', 0)/r['count']*100:.0f}%)"
+        print(f"  {_pad(r['strategy'].display_name, 14)} {_pad(reg_s, 9)} {_pad(tp_s, 9)} {_pad(sl_s, 9)}")
 
     print(f'\n{"=" * 120}')
 
@@ -598,6 +658,12 @@ def mode_scan(cache, strategies):
             tg = date_cls(int(tp[0]), int(tp[1]), int(tp[2]))
             days_natural = f'{(today_date - tg).days}天'
 
+        # 交易日（距上市委通过）
+        trading_days = ''
+        if tongguo_date:
+            ti = find_idx(dates, tongguo_date)
+            trading_days = f"D+{today_idx - ti}"
+
         # 检查今日策略触发
         triggered = {s.key: s.matches(factors) for s in strategies}
 
@@ -608,6 +674,7 @@ def mode_scan(cache, strategies):
             'factors': factors,
             'tongguo_date': tongguo_date,
             'days_natural': days_natural,
+            'trading_days': trading_days,
             'first_signal_date': first_signal_date,
             'triggered': triggered,
             'scan_started': scan_started,
@@ -617,39 +684,44 @@ def mode_scan(cache, strategies):
     buy_signals = [d for d in pool_data if any(d['triggered'].values()) and d.get('scan_started', False)]
     if buy_signals:
         print(f"\n  买入信号 ({len(buy_signals)} 只，T+1 开盘买入):")
-        print(f"  {'名称':<12} {'代码':>8} {'收盘':>8} "
-              f"{'pre3':>7} {'pre5':>7} {'mom10':>7} {'vol5':>6} {'触发策略'}")
+        hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('收盘', 8)} {_pad('pre3', 7)} {_pad('pre5', 7)} {_pad('mom10', 8)} {_pad('vol5', 5)} 触发策略"
+        print(hdr)
         print("  " + "-" * 100)
         for item in buy_signals:
             f = item['factors']
             tags = [s.display_name for s in strategies if item['triggered'].get(s.key)]
-            print(f"  {item['name']:<12} {item['code']:>8} {item['close']:>8.2f} "
-                  f"{f['pre3']:>+6.1f}% {f['pre5']:>+6.1f}% {f['mom10']:>+6.1f}% {f['vol5']:>5.2f} "
-                  f"{' '.join(tags)}")
+            c = f"{item['close']:.2f}"
+            p3 = f"{f['pre3']:+.1f}%"
+            p5 = f"{f['pre5']:+.1f}%"
+            m10 = f"{f['mom10']:+.1f}%"
+            v5 = f"{f['vol5']:.2f}"
+            row = f"  {_pad(item['name'], 14)} {_pad(item['code'], 8)} {_pad(c, 8)} {_pad(p3, 7)} {_pad(p5, 7)} {_pad(m10, 8)} {_pad(v5, 5)} {' '.join(tags)}"
+            print(row)
 
     # 即将买入 (因子已匹配但尚未进入D+20窗口)
     pending_signals = [d for d in pool_data if any(d['triggered'].values()) and not d.get('scan_started', False)]
     if pending_signals:
         print(f"\n  即将买入 ({len(pending_signals)} 只，等待进入D+{SCAN_START}窗口):")
-        print(f"  {'名称':<12} {'代码':>8} {'收盘':>8} "
-              f"{'上市委通过':>12} {'自然天':>5} "
-              f"{'pre3':>7} {'pre5':>7} {'mom10':>7} {'vol5':>6} {'触发策略'}")
-        print("  " + "-" * 110)
+        hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('收盘', 8)} {_pad('上市委通过', 16)} {_pad('自然天', 10)} {_pad('pre3', 7)} {_pad('pre5', 7)} {_pad('mom10', 8)} {_pad('vol5', 5)} 触发策略"
+        print(hdr)
+        print("  " + "-" * 114)
         for item in pending_signals:
             f = item['factors']
             tags = [s.display_name for s in strategies if item['triggered'].get(s.key)]
             tg = item['tongguo_date'] or '--'
-            print(f"  {item['name']:<12} {item['code']:>8} {item['close']:>8.2f} "
-                  f"{tg:>12} {item['days_natural']:>5} "
-                  f"{f['pre3']:>+6.1f}% {f['pre5']:>+6.1f}% {f['mom10']:>+6.1f}% {f['vol5']:>5.2f} "
-                  f"{' '.join(tags)}")
+            c = f"{item['close']:.2f}"
+            p3 = f"{f['pre3']:+.1f}%"
+            p5 = f"{f['pre5']:+.1f}%"
+            m10 = f"{f['mom10']:+.1f}%"
+            v5 = f"{f['vol5']:.2f}"
+            row = f"  {_pad(item['name'], 14)} {_pad(item['code'], 8)} {_pad(c, 8)} {_pad(tg, 16)} {_pad(item['days_natural'], 10)} {_pad(p3, 7)} {_pad(p5, 7)} {_pad(m10, 8)} {_pad(v5, 5)} {' '.join(tags)}"
+            print(row)
 
     # 监控池
     print(f"\n  监控池 ({len(pool_data)} 只):")
-    print(f"  {'名称':<12} {'代码':>8} {'收盘':>8} "
-          f"{'上市委通过':>12} {'自然天':>5} {'首次信号':>12} "
-          f"{'pre3':>7} {'pre5':>7} {'mom10':>7} {'vol5':>6} {'信号'}")
-    print("  " + "-" * 105)
+    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('收盘', 8)} {_pad('上市委通过', 16)} {_pad('D+', 6)} {_pad('首次信号', 16)} {_pad('pre3', 7)} {_pad('pre5', 7)} {_pad('mom10', 8)} {_pad('vol5', 5)} 信号"
+    print(hdr)
+    print("  " + "-" * 122)
     for item in pool_data:
         f = item['factors']
         tags = [s.display_name for s in strategies if item['triggered'].get(s.key)]
@@ -658,12 +730,22 @@ def mode_scan(cache, strategies):
             sig_tag = sig_tag + '(待)' if sig_tag else ''
         tg = item['tongguo_date'] or '--'
         fs = item['first_signal_date'] or '--'
-        print(f"  {item['name']:<12} {item['code']:>8} {item['close']:>8.2f} "
-              f"{tg:>12} {item['days_natural']:>5} {fs:>12} "
-              f"{f['pre3']:>+6.1f}% {f['pre5']:>+6.1f}% {f['mom10']:>+6.1f}% {f['vol5']:>5.2f} {sig_tag}")
+        c = f"{item['close']:.2f}"
+        p3 = f"{f['pre3']:+.1f}%"
+        p5 = f"{f['pre5']:+.1f}%"
+        m10 = f"{f['mom10']:+.1f}%"
+        v5 = f"{f['vol5']:.2f}"
+        row = f"  {_pad(item['name'], 14)} {_pad(item['code'], 8)} {_pad(c, 8)} {_pad(tg, 16)} {_pad(item['trading_days'], 6)} {_pad(fs, 16)} {_pad(p3, 7)} {_pad(p5, 7)} {_pad(m10, 8)} {_pad(v5, 5)} {sig_tag}"
+        print(row)
 
     # 策略说明
-    print(f"\n  策略说明:")
+    print(f"\n  因子说明:")
+    print(f"    pre3  = 距今日3个交易日的跌幅 (T-3 至 T-1 收盘价涨幅)")
+    print(f"    pre5  = 距今日5个交易日的跌幅 (T-5 至 T-1 收盘价涨幅)")
+    print(f"    mom10 = 近10个交易日涨幅 (T-10 至 T-1 收盘价涨幅)")
+    print(f"    vol5  = 今日成交量 / 近5日平均成交量 (<1 缩量, >1 放量)")
+    print(f"  卖出说明: exit=REG 表示发现'同意注册'后次日卖出")
+    print(f"  策略说明:")
     for s in strategies:
         print(f"    {s.display_name}: {s.label}  (exit={s.best_exit}, 胜={s.win_rate}, 年化={s.annual})")
     print(f"  卖出: TP +{TP}% / SL {SL}%（持仓期间每日盯市，触发次日卖出）")
