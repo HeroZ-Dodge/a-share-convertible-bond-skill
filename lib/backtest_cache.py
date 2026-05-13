@@ -333,6 +333,44 @@ class BacktestCache:
     # 集思录数据（统一表：待发 + 已上市）
     # ============================================================
 
+    def get_jisilu_last_fetch_date(self) -> str:
+        """返回 jisilu_bonds 最近一次刷新日期（YYYY-MM-DD）。"""
+        with self._get_conn() as conn:
+            row = conn.execute('''
+                SELECT MAX(date(fetched_at)) AS last_date
+                FROM jisilu_bonds
+                WHERE fetched_at IS NOT NULL AND fetched_at != ''
+            ''').fetchone()
+        return row['last_date'] if row and row['last_date'] else ''
+
+    def ensure_jisilu_data_for_today(
+        self,
+        fetch_history: bool = False,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        确保当天已从集思录刷新过一次数据。
+
+        当天首次调用会访问集思录 API 并写入 backtest_cache.db；当天后续调用直接复用库内缓存。
+        """
+        today = datetime.now().strftime('%Y-%m-%d')
+        last_date = self.get_jisilu_last_fetch_date()
+        if not force and last_date == today:
+            print(f'📦 集思录数据已是今日缓存 ({today})，直接读取 backtest_cache.db')
+            return {'refreshed': False, 'date': today, 'last_date': last_date, 'total': 0}
+
+        print(f'📥 今日首次刷新集思录数据 ({today})...')
+        stats = self.save_jisilu_data(fetch_pending=True, fetch_history=fetch_history)
+        refreshed = stats.get('total', 0) > 0
+        if not refreshed:
+            print('⚠️  集思录刷新未写入新数据，将继续使用 backtest_cache.db 现有缓存')
+        return {
+            'refreshed': refreshed,
+            'date': today,
+            'last_date': self.get_jisilu_last_fetch_date(),
+            **stats,
+        }
+
     def save_jisilu_data(self, fetch_pending: bool = True, fetch_history: bool = False) -> Dict[str, int]:
         """
         获取集思录待发+已上市数据，合并写入 jisilu_bonds 表
@@ -430,25 +468,33 @@ class BacktestCache:
                     req = urllib.request.Request(url, headers=headers)
                     with urllib.request.urlopen(req, timeout=30) as resp:
                         data = json.loads(resp.read().decode('utf-8'))
-                    # 待发 API 返回 {"code": 200, "data": {"rows": [{"cell": {...}}]}}
-                    rows = data.get('data', {}).get('rows', [])
-                    for row in rows:
-                        item = row.get('cell', {})
-                        item_row = _item_to_row(item, 'ON')
-                        conn.execute('''
-                            INSERT OR REPLACE INTO jisilu_bonds
-                            (stock_code, bond_id, stock_nm, bond_nm, price, increase_rt, pma_rt,
-                             margin_flg, pb, rid, audit_id, registration, progress, progress_nm,
-                             progress_nm2, progress_dt, progress_full, accept_date, amount,
-                             convert_price, cb_amount, cb_flag, cb_type, ap_flag, apply_date,
-                             apply_cd, apply10, apply_tips, ration_cd, ration, ration_rt, record_dt,
-                             record_price, list_date, list_price, status_cd, ma20_price, online_amount,
-                             lucky_draw_rt, single_draw, valid_apply, individual_limit, underwriter_rt,
-                             rating_cd, offline_limit, offline_accounts, offline_draw, valid_apply_raw,
-                             jsl_advise_text, b_shares, pg_shares, naps, cp_flag, orders, fetched_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', item_row)
-                        stats['total'] += 1
+                    # 集思录接口存在两种结构：
+                    # {"data": {"rows": [{"cell": {...}}]}} 或 {"data": [{...}]}
+                    payload = data.get('data', {})
+                    if isinstance(payload, dict):
+                        rows = [row.get('cell', {}) for row in payload.get('rows', [])]
+                    elif isinstance(payload, list):
+                        rows = payload
+                    else:
+                        rows = []
+                    pending_rows = [_item_to_row(item, 'ON') for item in rows]
+                    if pending_rows:
+                        conn.execute("DELETE FROM jisilu_bonds WHERE status_cd = 'ON'")
+                        for item_row in pending_rows:
+                            conn.execute('''
+                                INSERT OR REPLACE INTO jisilu_bonds
+                                (stock_code, bond_id, stock_nm, bond_nm, price, increase_rt, pma_rt,
+                                 margin_flg, pb, rid, audit_id, registration, progress, progress_nm,
+                                 progress_nm2, progress_dt, progress_full, accept_date, amount,
+                                 convert_price, cb_amount, cb_flag, cb_type, ap_flag, apply_date,
+                                 apply_cd, apply10, apply_tips, ration_cd, ration, ration_rt, record_dt,
+                                 record_price, list_date, list_price, status_cd, ma20_price, online_amount,
+                                 lucky_draw_rt, single_draw, valid_apply, individual_limit, underwriter_rt,
+                                 rating_cd, offline_limit, offline_accounts, offline_draw, valid_apply_raw,
+                                 jsl_advise_text, b_shares, pg_shares, naps, cp_flag, orders, fetched_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', item_row)
+                            stats['total'] += 1
                 except Exception as e:
                     print(f'⚠️  待发数据获取失败: {e}')
 

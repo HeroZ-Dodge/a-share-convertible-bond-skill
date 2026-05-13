@@ -1065,6 +1065,7 @@ def main():
         return
 
     if is_sync_db:
+        cache.ensure_jisilu_data_for_today()
         mode_sync_db(cache)
         return
 
@@ -1097,6 +1098,8 @@ def main():
         ret = result.get('return_pct', 0)
         print(f"已记录卖出: {code} 卖价={price:.2f} 日期={date} 收益={ret:+.2f}%")
         return
+
+    cache.ensure_jisilu_data_for_today()
 
     if mode == '--scan':
         mode_scan(cache)
