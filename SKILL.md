@@ -1,178 +1,83 @@
 ---
 name: a-share-convertible-bond
-description: 挖掘 A 股 分析历史节点（同意注册/上市委通过）的股价规律。
+description: 处理 A 股可转债注册前信号监控、买入提示、持仓退出和多策略回测，核心入口是 scripts/pre_reg_monitor.py 与 scripts/monitor_multi_strategy.py。
 ---
 
-# A 股可转债买入信号挖掘
+# A 股可转债注册前信号监控
 
-## 核心逻辑
+这个 skill 只围绕两个脚本工作：
 
-抢权配债的收益关键在于**何时买入正股**。统计发现：同意注册前 5 天，股价平均上涨 +4.56%，上涨概率 81.8%，说明有资金可能提前获知消息并布局。
+- `scripts/pre_reg_monitor.py`
+- `scripts/monitor_multi_strategy.py`
 
-本技能通过监控转债审批进度（交易所受理 → 上市委通过 → 同意注册 → 发行公告），在早期节点发现后持续跟踪股价走势，捕捉资金提前布局的信号。
+它们共同覆盖：
+
+- 注册前信号扫描
+- D+1 买入逻辑
+- 持仓止盈止损/注册日退出
+- 单策略与多策略回测
+- 理论信号和实际交易记录对比
+
+## 使用范围
+
+当用户要做下面这些事时使用这个 skill：
+
+- 扫描“上市委通过 -> 同意注册”期间的正股异动
+- 依据收盘价、成交量和均线因子判断买点
+- 对单策略或多策略做历史回测
+- 记录、查询或对比理论买卖信号
+
+不要把这个 skill 当成通用的可转债研究文档。优先围绕这两个脚本现有能力工作。
+
+## 主要入口
+
+### `scripts/pre_reg_monitor.py`
+
+单套注册前策略脚本，关注“上市委通过 -> 同意注册”区间。
+
+常用模式：
+
+```bash
+python3 scripts/pre_reg_monitor.py --scan
+python3 scripts/pre_reg_monitor.py --backtest
+python3 scripts/pre_reg_monitor.py --backtest --limit 100
+python3 scripts/pre_reg_monitor.py --backtest --strategy mom_recover
+```
+
+脚本内置的策略因子基于 K 线数据，不使用注册日之后的信息。
+
+### `scripts/monitor_multi_strategy.py`
+
+多策略组合脚本，策略从 `lib/strategies.py` 读取，支持监控、数据库同步和回测。
+
+常用模式：
+
+```bash
+python3 scripts/monitor_multi_strategy.py
+python3 scripts/monitor_multi_strategy.py --scan
+python3 scripts/monitor_multi_strategy.py --hold
+python3 scripts/monitor_multi_strategy.py --combo
+python3 scripts/monitor_multi_strategy.py --status
+python3 scripts/monitor_multi_strategy.py --backtest
+python3 scripts/monitor_multi_strategy.py --backtest --combo
+python3 scripts/monitor_multi_strategy.py --backtest --combo all
+python3 scripts/monitor_multi_strategy.py --sync-db
+python3 scripts/monitor_multi_strategy.py --compare CODE
+python3 scripts/monitor_multi_strategy.py --buy CODE DATE PRICE [REG_DATE]
+python3 scripts/monitor_multi_strategy.py --sell CODE DATE PRICE [REG_DATE]
+```
 
 ## 工作流程
 
-```
-集思录待发转债 → 筛选上市委通过后的标的 → 持续监控股价/成交量 → 触发信号时提示
-```
+1. 从集思录等数据源读取待发或已注册转债。
+2. 解析 `progress_full` 中的“上市委通过”和“同意注册”日期。
+3. 用 `close`、`volume`、均线偏离、动量等因子判断是否触发策略。
+4. 监控模式下，输出触发标的、策略命中情况和退出状态。
+5. 回测模式下，按脚本定义的 D+1 买入、D+9 或 TP/SL 退出规则统计收益。
 
-## 快速开始
+## 处理原则
 
-### 🎯 日常监控（核心功能）
-
-监控上市委通过后的转债，检测资金提前布局信号。
-
-```bash
-# 运行一次
-python3 scripts/monitor/monitor_latent_strategy.py --once
-
-# 持续监控（每 60 分钟）
-python3 scripts/monitor/monitor_latent_strategy.py
-
-# 查看进化报告
-python3 scripts/monitor/monitor_latent_strategy.py --report
-
-# 导出数据
-python3 scripts/monitor/monitor_latent_strategy.py --export
-```
-
-**监控条件**（满足时触发信号）：
-- 时间窗口：上市委通过后 25-55 天
-- 股价连续 2 日上涨 >2%
-- 股价突破 20 日高点
-- 股票质量 B 级及以上（趋势 + 动量 + 成交量 + 波动性综合评估）
-
-详见：[scripts/monitor/README.md](scripts/monitor/README.md)
-
----
-
-### 📋 查看待发转债
-
-从集思录获取待发转债列表，公告发布前即可发现机会。
-
-```bash
-python3 scripts/analyze_pending.py              # 全部
-python3 scripts/analyze_pending.py --compact    # 紧凑模式
-python3 scripts/analyze_pending.py --limit 5    # 前 5 只
-```
-
----
-
-### 📊 历史节点分析（辅助研究）
-
-分析历史数据，理解各审批节点前后的股价规律：
-
-```bash
-# 同意注册后股价变化（不同买入/卖出时点的收益）
-python3 scripts/analyze_registration_entry.py
-
-# 同意注册对股价的影响（趋势分析）
-python3 scripts/analyze_registration_impact.py
-
-# 同意注册到发行公告期间的股价变化
-python3 scripts/analyze_registration_to_announcement.py
-
-# 同意注册前的早期异动信号
-python3 scripts/analyze_early_signals.py
-```
-
-## 核心功能
-
-### 配债额度计算
-
-```python
-from lib.bond_calculator import BondCalculator
-
-calc = BondCalculator(target_bonds=10, bond_price=100)
-
-# 配债额度 = 持股数 × 每股配售额
-# 可配张数 = floor(配债额度 / 100)
-result = calc.calculate_allocation(
-    stock_code='300622',
-    shares=1500,
-    per_share_amount=1.6457
-)
-```
-
-### 数据获取
-
-```python
-from lib.data_source import BondDataSource
-
-# 自动优先集思录，失败降级东方财富
-ds = BondDataSource()
-bonds, source = ds.fetch_bonds(limit=10, pending_only=True)
-```
-
-### 股票质量评估
-
-```python
-from lib.stock_quality import StockQualityEvaluator
-
-evaluator = StockQualityEvaluator()
-quality = evaluator.evaluate('300622', prices)
-# 返回 A/B/C/D 等级，基于趋势/动量/成交量/波动性
-```
-
-## 数据源
-
-| 数据源 | 用途 | 特点 |
-|--------|------|------|
-| 集思录 | 待发转债 + 审批进度 | 公告发布前即可获取，推荐优先使用 |
-| 东方财富 | 已上市转债列表 | 数据完整、更新及时 |
-| 新浪财经 | 股票历史价格 | 支持 90 天历史 K 线 |
-
-## 注意事项
-
-1. **时间敏感**：从公告到登记日通常只有 3-5 个交易日
-2. **T+1 交收**：T 日买入股票，T+1 日才到账
-3. **破发风险**：新债上市可能跌破 100 元发行价
-4. **抢权风险**：为配债买入股票可能面临股价下跌
-5. **潜伏策略**：前 10 个案例进化效果不明显，需要耐心积累数据
-
-## 目录结构
-
-```
-a-share-convertible-bond-skill/
-├── SKILL.md                          # 技能定义（本文件）
-├── README.md                         # 使用说明
-├── monitor_history.json              # 监控历史记录
-│
-├── data/                             # 本地数据
-│   ├── bonds.db                      # SQLite数据库
-│   ├── pending_bonds_history.json    # 待发转债历史
-│   ├── signals_history.json          # 信号历史
-│   └── evolution_stats.json          # 进化统计
-│
-├── lib/                              # 核心库模块
-│   ├── __init__.py
-│   ├── data_source.py                # 数据源接口（集思录/东方财富/新浪财经）
-│   ├── bond_calculator.py            # 配债计算模块
-│   ├── report.py                     # 报告生成模块
-│   ├── stock_quality.py              # 股票质量评估
-│   ├── signal_tracker.py             # 信号跟踪
-│   ├── self_evolution.py             # 自我进化
-│   ├── sqlite_database.py            # SQLite数据库
-│   └── local_database.py             # 本地数据存储
-│
-├── scripts/                          # 脚本
-│   ├── analyze_pending.py            # 待发转债列表
-│   ├── analyze_registration_entry.py # 同意注册入场分析
-│   ├── analyze_registration_impact.py# 同意注册影响分析
-│   ├── analyze_registration_to_announcement.py  # 注册→公告分析
-│   ├── analyze_early_signals.py      # 早期信号分析
-│   ├── monitor_history.json          # 监控历史
-│   │
-│   └── monitor/                      # 监控脚本
-│       ├── monitor_latent_strategy.py    # 潜伏策略监控（主脚本）
-│       ├── backtest_latent_strategy.py   # 潜伏策略回测
-│       ├── README.md                     # 使用说明
-│       └── 潜伏策略监控使用说明.md         # 详细文档
-│
-├── docs/                             # 分析报告
-├── reference/                        # 参考资料
-│   └── api-docs.md                   # API 文档
-│
-└── test_stock_quality.py             # 股票质量评估测试
-```
+- 直接复用脚本现有参数和输出格式，不要虚构额外命令。
+- 因子计算要遵守无未来函数原则。
+- 如果要改策略条件，优先改 `lib/strategies.py` 或脚本对应的策略定义，再同步调整 skill 描述。
+- 如果用户请求的是历史分析、监控逻辑或回测结果，就优先查看这两个脚本，而不是扩展到其他未定义功能。
