@@ -64,7 +64,7 @@ class EastmoneyAPI:
     def __init__(self, timeout: int = 15):
         self.timeout = timeout
     
-    def _request(self, url: str, headers: dict = HEADERS) -> Optional[dict]:
+    def _request(self, url: str, headers: dict = HEADERS, log_error: bool = True) -> Optional[dict]:
         """发送 HTTP 请求"""
         import gzip
         try:
@@ -75,7 +75,8 @@ class EastmoneyAPI:
                     raw_data = gzip.decompress(raw_data)
                 return json.loads(raw_data.decode('utf-8'))
         except Exception as e:
-            print(f"API 请求失败：{url[:100]}... - {e}")
+            if log_error:
+                print(f"API 请求失败：{url[:100]}... - {e}")
             return None
     
     def _get_market_prefix(self, stock_code: str) -> str:
@@ -86,7 +87,7 @@ class EastmoneyAPI:
 
     # ==================== 交易日历 ====================
 
-    def fetch_trading_dates(self, days: int = 10) -> List[str]:
+    def fetch_trading_dates(self, days: int = 10, quiet: bool = False) -> List[str]:
         """获取最近交易日列表（通过上证指数K线推断）
 
         Args:
@@ -103,7 +104,7 @@ class EastmoneyAPI:
             f"klt=101&fqt=1&"
             f"lmt={days}"
         )
-        data = self._request(url)
+        data = self._request(url, log_error=not quiet)
         if not data or not data.get('data') or not data['data'].get('klines'):
             return []
         dates = []
@@ -116,7 +117,7 @@ class EastmoneyAPI:
 
     # ==================== K 线数据 ====================
 
-    def fetch_stock_kline(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
+    def fetch_stock_kline(self, stock_code: str, days: int = 90, quiet: bool = False) -> List[Dict[str, Any]]:
         """
         获取股票日 K 线数据（东方财富 push2 接口）
 
@@ -138,7 +139,7 @@ class EastmoneyAPI:
             f"lmt={days}"
         )
 
-        data = self._request(url)
+        data = self._request(url, log_error=not quiet)
         if not data or not data.get('data') or not data['data'].get('klines'):
             return []
 
@@ -164,7 +165,7 @@ class EastmoneyAPI:
 
     # ==================== 主力资金流向 ====================
 
-    def fetch_fund_flow(self, stock_code: str, days: int = 120) -> List[Dict[str, Any]]:
+    def fetch_fund_flow(self, stock_code: str, days: int = 120, quiet: bool = False) -> List[Dict[str, Any]]:
         """
         获取主力资金流向日 K 数据
 
@@ -185,7 +186,7 @@ class EastmoneyAPI:
             f"klt=101&lmt={days}"
         )
 
-        data = self._request(url)
+        data = self._request(url, log_error=not quiet)
         if not data or not data.get('data') or not data['data'].get('klines'):
             return []
 
@@ -207,7 +208,7 @@ class EastmoneyAPI:
 
     # ==================== 实时行情快照 ====================
 
-    def fetch_realtime_quote(self, stock_code: str) -> Optional[Dict[str, Any]]:
+    def fetch_realtime_quote(self, stock_code: str, quiet: bool = False) -> Optional[Dict[str, Any]]:
         """
         获取股票实时行情快照（含 PE/PB/ROE/融资融券）
 
@@ -229,7 +230,7 @@ class EastmoneyAPI:
             f"f67,f68,f73,f74,f75,f148,f149,f150"
         )
 
-        data = self._request(url)
+        data = self._request(url, log_error=not quiet)
         if not data or not data.get('data'):
             return None
 
@@ -635,6 +636,74 @@ class EastmoneyAPI:
             print(f"获取上市价格失败 {bond_code}: {e}")
         
         return None
+
+
+# ==================== 腾讯行情 API ====================
+
+class TencentAPI:
+    """腾讯行情数据接口"""
+
+    def __init__(self, timeout: int = 15):
+        self.timeout = timeout
+
+    def _get_market_prefix(self, stock_code: str) -> str:
+        """获取市场前缀 (0=深市, 1=沪市)"""
+        if stock_code.startswith('6') or stock_code.startswith('900'):
+            return 'sh'
+        return 'sz'
+
+    def fetch_stock_kline(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
+        """
+        获取腾讯日 K 线数据，包含当日最新交易日。
+
+        腾讯日线接口通常比部分历史 K 线源更容易拿到当天数据。
+        """
+        import json
+
+        market = self._get_market_prefix(stock_code)
+        symbol = f'{market}{stock_code}'
+        url = (
+            f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
+            f"param={symbol},day,,,{days},qfq"
+        )
+
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode('utf-8'))
+        except Exception as e:
+            print(f"获取腾讯日线失败 {stock_code}: {e}")
+            return []
+
+        if not data or data.get('code') != 0 or not data.get('data'):
+            return []
+
+        stk = data['data'].get(symbol)
+        if not stk:
+            return []
+
+        buf = stk.get('qfqday') or stk.get('day') or []
+        result = []
+        for item in buf:
+            if len(item) < 6:
+                continue
+            try:
+                result.append({
+                    'date': item[0],
+                    'open': float(item[1]),
+                    'close': float(item[2]),
+                    'high': float(item[3]),
+                    'low': float(item[4]),
+                    'volume': float(item[5]),
+                    'amount': 0,
+                    'amplitude': 0,
+                    'change_pct': 0,
+                    'change_amount': 0,
+                    'turnover_rate': 0,
+                })
+            except (TypeError, ValueError):
+                continue
+        return result
 
 
 # ==================== 新浪财经 API ====================

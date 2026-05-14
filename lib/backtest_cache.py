@@ -731,7 +731,17 @@ class BacktestCache:
 
     def fetch_and_save_kline(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
         """
-        从新浪财经获取日 K 线并缓存（失败时降级到东方财富）
+        从多数据源获取日 K 线并缓存。
+
+        数据源顺序：
+        1. 腾讯日线
+        2. 新浪日线
+        3. 东方财富日线
+
+        规则：
+        - 统一归一化为同一字段结构
+        - 优先保留日期更新更晚的数据源
+        - 同一天重复数据按源优先级去重
 
         Args:
             stock_code: 6位股票代码
@@ -740,16 +750,18 @@ class BacktestCache:
         Returns:
             K 线数据列表
         """
-        from lib.data_source import SinaFinanceAPI, EastmoneyAPI
+        from lib.data_source import TencentAPI, SinaFinanceAPI, EastmoneyAPI
 
-        klines = []
+        def _max_kline_date(items: List[Dict[str, Any]]) -> str:
+            if not items:
+                return ''
+            dates = [k.get('date', '') for k in items if k.get('date')]
+            return max(dates) if dates else ''
 
-        # 优先新浪财经（稳定、无 SSL 断连问题）
-        sina = SinaFinanceAPI(timeout=20)
-        prices = sina.fetch_history(stock_code, days=days)
-        if prices:
+        def _normalize_sina_prices(prices: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+            result = []
             for date, data in sorted(prices.items()):
-                klines.append({
+                result.append({
                     'date': date,
                     'open': data['open'],
                     'close': data['close'],
@@ -762,13 +774,79 @@ class BacktestCache:
                     'change_amount': 0,
                     'turnover_rate': 0,
                 })
+            return result
 
-        # 降级到东方财富
-        if not klines:
+        def _normalize_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            norm = []
+            for row in rows or []:
+                if not row.get('date'):
+                    continue
+                try:
+                    norm.append({
+                        'date': row['date'],
+                        'open': float(row.get('open', 0) or 0),
+                        'close': float(row.get('close', 0) or 0),
+                        'high': float(row.get('high', 0) or 0),
+                        'low': float(row.get('low', 0) or 0),
+                        'volume': float(row.get('volume', 0) or 0),
+                        'amount': float(row.get('amount', 0) or 0),
+                        'amplitude': float(row.get('amplitude', 0) or 0),
+                        'change_pct': float(row.get('change_pct', 0) or 0),
+                        'change_amount': float(row.get('change_amount', 0) or 0),
+                        'turnover_rate': float(row.get('turnover_rate', 0) or 0),
+                    })
+                except (TypeError, ValueError):
+                    continue
+            return norm
+
+        def _merge_sources(sources: List[Tuple[str, List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+            merged: Dict[str, Dict[str, Any]] = {}
+            for _, rows in sources:
+                for row in rows:
+                    date = row.get('date', '')
+                    if not date:
+                        continue
+                    if date not in merged:
+                        merged[date] = row
+            return [merged[d] for d in sorted(merged.keys())]
+
+        # 三路数据源都尝试，后续按最新日期和优先级合并
+        tencent = TencentAPI(timeout=15)
+        tencent_rows = _normalize_rows(tencent.fetch_stock_kline(stock_code, days=days))
+
+        sina = SinaFinanceAPI(timeout=20)
+        sina_rows = _normalize_rows(_normalize_sina_prices(sina.fetch_history(stock_code, days=days)))
+
+        latest_trade_date = self._get_latest_trading_date()
+
+        sources = [
+            ('tencent', tencent_rows),
+            ('sina', sina_rows),
+        ]
+        sources = [(name, rows) for name, rows in sources if rows]
+        if not sources:
+            sources = []
+
+        # 只有在现有数据源没覆盖到最新交易日时，才静默尝试东方财富兜底
+        need_eastmoney = False
+        if latest_trade_date:
+            current_latest = _max_kline_date(_merge_sources(sources)) if sources else ''
+            if not current_latest or current_latest < latest_trade_date:
+                need_eastmoney = True
+
+        if need_eastmoney:
             em = EastmoneyAPI(timeout=15)
-            em_klines = em.fetch_stock_kline(stock_code, days=days)
-            if em_klines:
-                klines = em_klines
+            em_rows = _normalize_rows(em.fetch_stock_kline(stock_code, days=days, quiet=True))
+            if em_rows:
+                sources.append(('eastmoney', em_rows))
+
+        if not sources:
+            return []
+
+        # 优先把最新交易日覆盖更完整的源排在前面
+        sources.sort(key=lambda x: (_max_kline_date(x[1]), len(x[1])), reverse=True)
+
+        klines = _merge_sources(sources)
 
         if not klines:
             return []
@@ -806,7 +884,7 @@ class BacktestCache:
         return cursor.fetchall()
 
     def _get_latest_trading_date(self) -> str:
-        """获取最新交易日（通过新浪财经API，不依赖本地缓存）
+        """获取最新交易日（优先腾讯/东财，失败后回落新浪/缓存）
 
         同一会话内30分钟复用，避免频繁调API。
         """
@@ -814,6 +892,30 @@ class BacktestCache:
         now = time.time()
         if _latest_trade_date_cache['time'] and now - _latest_trade_date_cache['time'] < 1800:
             return _latest_trade_date_cache['date']
+
+        # 优先使用腾讯上证指数日线，通常最容易拿到当天交易日
+        try:
+            from lib.data_source import TencentAPI
+            tx = TencentAPI(timeout=15)
+            rows = tx.fetch_stock_kline('000001', days=10)
+            if rows:
+                result = max(r['date'] for r in rows if r.get('date'))
+                _latest_trade_date_cache = {'time': now, 'date': result}
+                return result
+        except Exception:
+            pass
+
+        # 东方财富交易日历兜底
+        try:
+            from lib.data_source import EastmoneyAPI
+            em = EastmoneyAPI(timeout=15)
+            trading_dates = em.fetch_trading_dates(days=10, quiet=True)
+            if trading_dates:
+                result = sorted(trading_dates)[-1]
+                _latest_trade_date_cache = {'time': now, 'date': result}
+                return result
+        except Exception:
+            pass
 
         from lib.data_source import SinaFinanceAPI
         sina = SinaFinanceAPI(timeout=15)

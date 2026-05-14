@@ -346,6 +346,57 @@ class MonitorDB:
                 'hold_days': hold_days,
             }
 
+    def upsert_simulated_position(self, stock_code: str, registration_date: str,
+                                  data: Dict) -> Dict[str, Any]:
+        """
+        写入模拟持仓（首次信号生效，后续同股信号不覆盖）
+
+        模拟持仓使用独立的 position_id，避免和真实/手动持仓互相冲突。
+        """
+        pos_id = f"sim_{stock_code}"
+        with self._get_conn() as conn:
+            row = conn.execute(
+                'SELECT * FROM positions WHERE position_id = ?',
+                (pos_id,)
+            ).fetchone()
+            if row:
+                return {'position_id': pos_id, 'created': False}
+
+            buy_date = data.get('theory_buy_date', '') or ''
+            buy_price = data.get('theory_buy_price')
+            triggered = data.get('triggered_strategies', [])
+            labels = data.get('strategy_labels', [])
+            notes = {
+                'origin': 'simulated',
+                'triggered_strategies': triggered,
+                'strategy_labels': labels,
+                'theory_exit_type': data.get('theory_exit_type', ''),
+                'theory_factors': data.get('theory_factors', {}),
+                'generated_at': datetime.now().isoformat(),
+            }
+
+            conn.execute('''
+                INSERT INTO positions
+                    (position_id, stock_code, stock_name, bond_code, bond_name,
+                     registration_date, planned_buy_date, actual_buy_date, actual_buy_price,
+                     buy_reason, status, source, notes, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'backfill', ?, CURRENT_TIMESTAMP)
+            ''', (
+                pos_id,
+                stock_code,
+                data.get('stock_name', ''),
+                data.get('bond_code', ''),
+                data.get('bond_name', ''),
+                registration_date,
+                buy_date,
+                buy_date,
+                buy_price,
+                '首个触发信号模拟买入',
+                json.dumps(notes, ensure_ascii=False),
+            ))
+            conn.commit()
+        return {'position_id': pos_id, 'created': True}
+
     def get_position_comparison(self, stock_code: str) -> Optional[Dict]:
         """
         获取某只股票的理论 vs 实际对比数据
@@ -363,7 +414,16 @@ class MonitorDB:
 
             actual = conn.execute('''
                 SELECT * FROM positions WHERE stock_code = ?
-                ORDER BY registration_date DESC LIMIT 1
+                ORDER BY
+                    CASE source
+                        WHEN 'real' THEN 0
+                        WHEN 'manual' THEN 0
+                        WHEN 'backfill' THEN 1
+                        ELSE 2
+                    END,
+                    registration_date DESC,
+                    id DESC
+                LIMIT 1
             ''', (stock_code,)).fetchone()
 
             if not theory and not actual:

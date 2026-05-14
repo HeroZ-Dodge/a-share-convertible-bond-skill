@@ -31,6 +31,7 @@
   --disable deep_pullback,up_momentum  禁用指定策略（逗号分隔，监控/回测均生效）
 """
 import sys, os, re
+import unicodedata
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lib.backtest_cache import BacktestCache
@@ -40,7 +41,18 @@ from lib.monitor_db import MonitorDB
 
 def _dw(s):
     """Display width (CJK chars = 2 cols)"""
-    return sum(2 if '一' <= c <= '鿿' else 1 for c in str(s))
+    width = 0
+    for c in str(s):
+        code = ord(c)
+        if c in ('\u200d', '\ufe0e', '\ufe0f') or unicodedata.combining(c):
+            continue
+        if unicodedata.east_asian_width(c) in ('F', 'W'):
+            width += 2
+        elif 0x2600 <= code <= 0x27BF or 0x1F300 <= code <= 0x1FAFF:
+            width += 2
+        else:
+            width += 1
+    return width
 
 
 def _pad(s, width, left=True):
@@ -50,7 +62,14 @@ def _pad(s, width, left=True):
     if dw >= width:
         result, used = '', 0
         for c in s:
-            cw = 2 if '一' <= c <= '鿿' else 1
+            if c in ('\u200d', '\ufe0e', '\ufe0f') or unicodedata.combining(c):
+                cw = 0
+            elif unicodedata.east_asian_width(c) in ('F', 'W'):
+                cw = 2
+            elif 0x2600 <= ord(c) <= 0x27BF or 0x1F300 <= ord(c) <= 0x1FAFF:
+                cw = 2
+            else:
+                cw = 1
             if used + cw > width:
                 break
             result += c
@@ -58,6 +77,17 @@ def _pad(s, width, left=True):
         return result + ' ' * (width - used)
     padding = width - dw
     return (s + ' ' * padding) if left else (' ' * padding + s)
+
+
+def _center(s, width):
+    """Center text to target display width"""
+    s = str(s)
+    dw = _dw(s)
+    if dw >= width:
+        return _pad(s, width)
+    left = (width - dw) // 2
+    right = width - dw - left
+    return ' ' * left + s + ' ' * right
 
 
 def find_idx(sd, target):
@@ -70,14 +100,19 @@ def find_idx(sd, target):
     return result
 
 
-def calc_factors(cache, sc, anchor):
-    """计算所有因子"""
+def calc_factors(cache, sc, anchor, as_of_date=None):
+    """计算所有因子。
+
+    盘中若 anchor 恰好是当天最新未收盘交易日，则回退到上一完整交易日。
+    """
     prices = cache.get_kline_as_dict(sc, days=1500)
     if not prices:
         return None
     sd = sorted(prices.keys())
     today_str = datetime.now().strftime('%Y-%m-%d')
     ri = find_idx(sd, anchor)
+    if as_of_date and ri > 0 and sd[ri] == as_of_date:
+        ri -= 1
     reg = prices[sd[ri]]
     reg_close = reg['close']
     if reg_close <= 0 or ri < 10:
@@ -114,6 +149,8 @@ def calc_factors(cache, sc, anchor):
 
     # Current
     latest_idx = find_idx(sd, today_str)
+    if latest_idx > 0 and sd[latest_idx] == today_str:
+        latest_idx -= 1
     if latest_idx < len(sd) and sd[latest_idx] <= today_str:
         current_close = prices[sd[latest_idx]].get('close', 0)
         current_date = sd[latest_idx]
@@ -560,7 +597,7 @@ def scan_registrations(cache):
         if calendar_diff > 20:
             continue
 
-        factors = calc_factors(cache, sc, anchor)
+        factors = calc_factors(cache, sc, anchor, as_of_date=today_str)
         if not factors:
             continue
 
@@ -570,6 +607,9 @@ def scan_registrations(cache):
         results.append({
             'code': sc,
             'name': (b.get('bond_name') or b.get('stock_name') or '?')[:12],
+            'stock_name': (b.get('stock_name') or '')[:12],
+            'bond_code': b.get('bond_code') or '',
+            'bond_name': (b.get('bond_name') or '')[:12],
             'anchor': anchor,
             'calendar_diff': calendar_diff,
             'days_since': factors.get('days_since', 0),
@@ -650,6 +690,168 @@ def active_tags(triggered):
 def print_strategy_tags(triggered):
     """打印触发的策略标签（别名，同 active_tags）"""
     return active_tags(triggered)
+
+
+def _position_source_label(position):
+    """将持仓 source 转为展示标签"""
+    if not position:
+        return '实际'
+    return '模拟' if position.get('source') == 'backfill' else '实际'
+
+
+def _first_triggered_strategy(triggered):
+    """返回首个命中的活跃策略 key"""
+    for key in registry.active_keys():
+        if triggered.get(key):
+            return key
+    return None
+
+
+def _hold_display_parts(factors, triggered):
+    """生成持仓展示所需的统一字段"""
+    bp = f"{factors['buy_price']:.2f}" if factors.get('buy_price') else '--'
+    cp = f"{factors['current_close']:.2f}" if factors.get('current_close') else '--'
+    pnl = f"{factors['pnl_pct']:+.1f}%" if factors.get('pnl_pct') is not None else '--'
+
+    tp_val, sl_val = 5, 5
+    exit_label = 'D+9'
+    first_key = _first_triggered_strategy(triggered)
+    if first_key:
+        s = registry.get(first_key)
+        if s:
+            tp_val, sl_val = parse_exit_thresholds(s.best_exit)
+            exit_label = s.best_exit or 'D+9'
+
+    pnl_val = factors.get('pnl_pct')
+    tp_mark = '✅' if pnl_val is not None and pnl_val >= tp_val else ' '
+    sl_mark = '⚠️' if pnl_val is not None and pnl_val <= -sl_val else ' '
+    exit_str = f"{tp_mark}{sl_mark} ({exit_label})"
+
+    return {
+        'buy_price': bp,
+        'current_price': cp,
+        'pnl': pnl,
+        'exit_str': exit_str,
+        'tags': print_strategy_tags(triggered),
+    }
+
+
+def _format_simulated_position(factors, triggered):
+    """将模拟持仓压成单行展示文本"""
+    parts = _hold_display_parts(factors, triggered)
+    if parts['buy_price'] == '--':
+        return '--'
+    return f"买{parts['buy_price']} 现{parts['current_price']} 盈{parts['pnl']} {parts['exit_str']} {parts['tags']}"
+
+
+def _format_t_plus(days, width=6):
+    """格式化 T+N，避免 T+ 后面出现多余空格"""
+    try:
+        return _pad(f"T+{int(days)}", width)
+    except (TypeError, ValueError):
+        return _pad('--', width)
+
+
+def _format_days(days, width=6):
+    """格式化纯天数显示"""
+    try:
+        return _pad(str(int(days)), width)
+    except (TypeError, ValueError):
+        return _pad('--', width)
+
+
+def _format_pct(value, width):
+    """格式化百分比字段"""
+    try:
+        return _pad(f"{float(value):+.1f}%", width)
+    except (TypeError, ValueError):
+        return _pad('--', width)
+
+
+def _build_hold_row_from_scan(r):
+    """把扫描结果转成持仓行所需字段"""
+    parts = _hold_display_parts(r['factors'], r['triggered'])
+    display_days = r.get('days_since', r['calendar_diff'])
+    return {
+        'name': r['name'],
+        'code': r['code'],
+        'days': display_days,
+        'buy_price': parts['buy_price'],
+        'current_price': parts['current_price'],
+        'pnl': parts['pnl'],
+        'exit_str': parts['exit_str'],
+        'tags': parts['tags'],
+    }
+
+
+def _hold_row_cells(row):
+    """把持仓行格式化成固定列字符串"""
+    return [
+        _pad(row['name'], 14),
+        _pad(row['code'], 8),
+        _format_t_plus(row['days'], 6),
+        _pad(row['buy_price'], 8),
+        _pad(row['current_price'], 8),
+        _pad(row['pnl'], 8),
+        _pad(row['exit_str'], 14),
+        row['tags'],
+    ]
+
+
+def _print_hold_table(title, rows):
+    """打印与持仓监控一致的表格"""
+    print(f"\n  📊 {title} ({len(rows)}只):")
+    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('T+', 6)} {_pad('买价', 8)} {_pad('现价', 8)} {_pad('盈亏', 8)} {_pad('止盈止损', 14)} {'触发策略'}"
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
+    if not rows:
+        print("  无持仓")
+        return
+    for row in rows:
+        print("  " + " ".join(_hold_row_cells(row)))
+
+
+def _build_simulated_hold_rows(cache, db, registrations):
+    """根据 backfill 持仓和最新扫描结果生成模拟持仓行"""
+    scan_map = {r['code']: r for r in registrations}
+    rows = []
+    for pos in db.get_backfill_positions():
+        if pos.get('status') != 'active':
+            continue
+        sc = pos.get('stock_code')
+        if not sc:
+            continue
+
+        r = scan_map.get(sc)
+        if r:
+            row = _build_hold_row_from_scan(r)
+            row['name'] = pos.get('stock_name') or row['name']
+            rows.append(row)
+            continue
+
+        reg_date = pos.get('registration_date') or ''
+        days = 0
+        if reg_date:
+            try:
+                days = (datetime.now() - datetime.strptime(reg_date, '%Y-%m-%d')).days
+            except ValueError:
+                days = 0
+
+        buy_price = pos.get('actual_buy_price')
+        buy_str = f"{buy_price:.2f}" if buy_price else '--'
+        rows.append({
+            'name': (pos.get('stock_name') or pos.get('bond_name') or '?')[:12],
+            'code': sc,
+            'days': days,
+            'buy_price': buy_str,
+            'current_price': '--',
+            'pnl': '--',
+            'exit_str': '--',
+            'tags': '—',
+        })
+
+    rows.sort(key=lambda x: x['days'])
+    return rows
 
 
 # ========== 输出模式 ==========
@@ -751,7 +953,7 @@ def mode_status(cache):
 
 
 def mode_sync_db(cache):
-    """将理论信号写入 monitor.db（自动跳过相同数据）"""
+    """将理论信号和模拟持仓写入 monitor.db（自动跳过相同数据）"""
     results = scan_registrations(cache)
     db = MonitorDB()
 
@@ -760,9 +962,10 @@ def mode_sync_db(cache):
                         if any(r['triggered'].get(k) for k in registry.active_keys())]
 
     if not triggered_results:
-        return 0
+        return {'theory_synced': 0, 'simulated_created': 0}
 
     synced = 0
+    simulated_created = 0
     for r in triggered_results:
         f = r['factors']
         triggered_keys = [k for k in registry.active_keys() if r['triggered'].get(k)]
@@ -784,6 +987,8 @@ def mode_sync_db(cache):
 
         db.upsert_theory_signal(r['code'], r['anchor'], {
             'stock_name': r.get('name', ''),
+            'bond_code': r.get('bond_code', ''),
+            'bond_name': r.get('bond_name', ''),
             'triggered_strategies': triggered_keys,
             'strategy_labels': triggered_labels,
             'calendar_diff': r['calendar_diff'],
@@ -800,9 +1005,27 @@ def mode_sync_db(cache):
             'current_price': f.get('current_price'),
             'current_date': f.get('current_date'),
         })
+        if f.get('buy_price') and f['buy_price'] > 0:
+            sim_result = db.upsert_simulated_position(r['code'], r['anchor'], {
+                'stock_name': r.get('stock_name') or r.get('name', ''),
+                'bond_code': r.get('bond_code', ''),
+                'bond_name': r.get('bond_name', ''),
+                'theory_buy_date': (datetime.strptime(r['anchor'], '%Y-%m-%d')
+                                  + __import__('datetime').timedelta(days=1)).strftime('%Y-%m-%d')
+                if r['anchor'] else '',
+                'theory_buy_price': f['buy_price'],
+                'triggered_strategies': triggered_keys,
+                'strategy_labels': triggered_labels,
+                'theory_exit_type': exit_type,
+                'theory_factors': {k: v for k, v in f.items()
+                                 if k not in ('buy_price', 'current_close', 'current_date',
+                                             'days_since', 'pnl_pct')},
+            })
+            if sim_result.get('created'):
+                simulated_created += 1
         synced += 1
 
-    return synced
+    return {'theory_synced': synced, 'simulated_created': simulated_created}
 
 
 def mode_scan(cache):
@@ -810,73 +1033,73 @@ def mode_scan(cache):
     db = MonitorDB()
     signals = scan_buy_signals(cache)
     today_str = datetime.now().strftime('%Y-%m-%d')
+    all_results = scan_registrations(cache)
 
     # 同步理论信号
-    synced = mode_sync_db(cache)
+    sync_stats = mode_sync_db(cache)
 
     print(f"\n{'='*110}")
-    print(f"多策略组合监控 — {today_str}" + (f" (同步 {synced} 个理论信号)" if synced else ""))
+    sync_msg = ""
+    if sync_stats['theory_synced'] or sync_stats['simulated_created']:
+        sync_msg = (f" (同步 {sync_stats['theory_synced']} 个理论信号"
+                    f"，生成 {sync_stats['simulated_created']} 条模拟持仓)")
+    print(f"多策略组合监控 — {today_str}{sync_msg}")
     print(f"{'='*110}")
 
     if not signals:
         print(f"\n  今日无买入信号")
-        # 显示近期注册事件（附加实际数据）
-        all_results = scan_registrations(cache)
         if all_results:
             print(f"\n  近期注册事件 ({len(all_results)}只，20天内):")
-            hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} {'天数':>6} {'策略触发'}"
+            hdr = (
+                f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} "
+                f"{_pad('T+', 6)} {_pad('策略触发', 18)} "
+                f"{_pad('pre3', 7)} {_pad('mom10', 8)} {_pad('rc', 6)} {_pad('vol', 5)}"
+            )
             print(hdr)
             print("  " + "-" * (_dw(hdr) - 2))
             for r in all_results[:10]:
                 tag = print_strategy_tags(r['triggered']) or '—'
                 f = r['factors']
                 d = r.get('days_since', r['calendar_diff'])
+                row = [
+                    _pad(r['name'], 14),
+                    _pad(r['code'], 8),
+                    _pad(r['anchor'], 16),
+                    _format_t_plus(d, 6),
+                    _pad(tag or '—', 18),
+                    _format_pct(f['pre3'], 7),
+                    _format_pct(f['mom10'], 8),
+                    _format_pct(f['rc'], 6),
+                    _pad(f"{f['vol_ratio5']:.2f}", 5),
+                ]
+                print("  " + " ".join(row))
+    else:
+        # 按触发数量排序（触发越多越优先）
+        signals.sort(key=lambda x: active_hit_count(x['triggered']), reverse=True)
 
-                # 读取实际数据
-                actual_info = ''
-                comp = db.get_position_comparison(r['code'])
-                if comp and comp.get('actual'):
-                    a = comp['actual']
-                    if a.get('actual_buy_price'):
-                        buy_p = f"买={a['actual_buy_price']:.2f}"
-                        if a.get('actual_sell_price'):
-                            sell_p = f"卖={a['actual_sell_price']:.2f}"
-                            ret_p = f"收益={a.get('return_pct', 0):+.1f}%"
-                            actual_info = f" [{buy_p} {sell_p} {ret_p}]"
-                        else:
-                            actual_info = f" [{buy_p} 持仓中]"
-                    elif a.get('status') == 'closed':
-                        actual_info = f" [已平仓]"
+        print(f"\n  📢 买入信号 ({len(signals)}只, D+1开盘):")
+        hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} {_pad('买价', 8)} {'触发策略'}"
+        print(hdr)
+        print("  " + "-" * (_dw(hdr) - 2))
 
-                print(f"  {_pad(r['name'], 14)} {_pad(r['code'], 8)} {_pad(r['anchor'], 16)} "
-                      f"T+{d:>3}  {tag}{actual_info}  "
-                      f"pre3={f['pre3']:+.1f}% mom10={f['mom10']:+.1f}% "
-                      f"rc={f['rc']:+.1f}% vol={f['vol_ratio5']:.2f}")
-        return
+        for s in signals:
+            f = s['factors']
+            tags = print_strategy_tags(s['triggered'])
+            bp = f"{s['factors']['buy_price']:.2f}" if s['factors']['buy_price'] else '--'
+            print(f"  {_pad(s['name'], 14)} {_pad(s['code'], 8)} {_pad(s['anchor'], 16)} {_pad(bp, 8)} {tags}")
 
-    # 按触发数量排序（触发越多越优先）
-    signals.sort(key=lambda x: active_hit_count(x['triggered']), reverse=True)
+        # 按策略分组
+        print(f"\n  按策略分组:")
+        for key in registry.active_keys():
+            group = [s for s in signals if s['triggered'].get(key)]
+            if group:
+                print(f"    {_display_name(key)}  sh={registry.get(key).sharpe}  exit={registry.get(key).best_exit}")
+                for s in group:
+                    bp = f"{s['factors']['buy_price']:.2f}" if s['factors']['buy_price'] else '--'
+                    print(f"      {s['name']} {s['code']} 买价{bp}")
 
-    print(f"\n  📢 买入信号 ({len(signals)}只, D+1开盘):")
-    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} {_pad('买价', 8)} {'触发策略'}"
-    print(hdr)
-    print("  " + "-" * (_dw(hdr) - 2))
-
-    for s in signals:
-        f = s['factors']
-        tags = print_strategy_tags(s['triggered'])
-        bp = f"{s['factors']['buy_price']:.2f}" if s['factors']['buy_price'] else '--'
-        print(f"  {_pad(s['name'], 14)} {_pad(s['code'], 8)} {_pad(s['anchor'], 16)} {_pad(bp, 8)} {tags}")
-
-    # 按策略分组
-    print(f"\n  按策略分组:")
-    for key in registry.active_keys():
-        group = [s for s in signals if s['triggered'].get(key)]
-        if group:
-            print(f"    {_display_name(key)}  sh={registry.get(key).sharpe}  exit={registry.get(key).best_exit}")
-            for s in group:
-                bp = f"{s['factors']['buy_price']:.2f}" if s['factors']['buy_price'] else '--'
-                print(f"      {s['name']} {s['code']} 买价{bp}")
+    simulated_rows = _build_simulated_hold_rows(cache, db, all_results)
+    _print_hold_table("模拟持仓", simulated_rows)
 
 
 def mode_hold(cache):
@@ -886,7 +1109,7 @@ def mode_hold(cache):
     today_str = datetime.now().strftime('%Y-%m-%d')
 
     print(f"\n  📊 持仓监控 ({len(holdings)}只):")
-    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {'持仓':>6} {_pad('买价', 8)} {_pad('现价', 8)} {_pad('盈亏', 8)} {'止盈止损':>10} {'触发策略'}"
+    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('T+', 6)} {_pad('买价', 8)} {_pad('现价', 8)} {_pad('盈亏', 8)} {_pad('止盈止损', 10)} {'触发策略'}"
     print(hdr)
     print("  " + "-" * (_dw(hdr) - 2))
 
@@ -897,24 +1120,12 @@ def mode_hold(cache):
     holdings.sort(key=lambda x: x['calendar_diff'])
     for h in holdings:
         f = h['factors']
-        bp = f"{f['buy_price']:.2f}" if f['buy_price'] else '--'
-        cp = f"{f['current_close']:.2f}" if f['current_close'] else '--'
-        pnl = f"{f['pnl_pct']:+.1f}%" if f['pnl_pct'] is not None else '--'
-
-        # 从触发的策略中取最优退出阈值
-        triggered_keys = [k for k in registry.active_keys() if h['triggered'].get(k)]
-        tp_val, sl_val = 5, 5
-        exit_label = 'D+9'
-        if triggered_keys:
-            s = registry.get(triggered_keys[0])
-            if s:
-                tp_val, sl_val = parse_exit_thresholds(s.best_exit)
-                exit_label = s.best_exit or 'D+9'
-
-        tp_mark = '✅' if f['pnl_pct'] and f['pnl_pct'] >= tp_val else ' '
-        sl_mark = '⚠️' if f['pnl_pct'] and f['pnl_pct'] <= -sl_val else ' '
-        exit_str = f"{tp_mark}{sl_mark} ({exit_label})"
-        tags = print_strategy_tags(h['triggered'])
+        parts = _hold_display_parts(f, h['triggered'])
+        bp = parts['buy_price']
+        cp = parts['current_price']
+        pnl = parts['pnl']
+        exit_str = parts['exit_str']
+        tags = parts['tags']
 
         # 显示交易日天数
         display_days = h.get('days_since', h['calendar_diff'])
@@ -925,18 +1136,28 @@ def mode_hold(cache):
         if comp and comp.get('actual'):
             a = comp['actual']
             if a.get('actual_buy_price'):
+                pos_label = _position_source_label(a)
                 actual_buy = f"{a['actual_buy_price']:.2f}"
                 if a.get('actual_sell_price'):
                     actual_sell = f"{a['actual_sell_price']:.2f}"
                     actual_ret = f"{a.get('return_pct', 0):+.1f}%"
-                    actual_info = f" |实际:买{actual_buy}卖{actual_sell}收{actual_ret}"
+                    actual_info = f" |{pos_label}:买{actual_buy}卖{actual_sell}收{actual_ret}"
                 else:
-                    actual_info = f" |实际:买{actual_buy}持仓中"
+                    actual_info = f" |{pos_label}:买{actual_buy}持仓中"
             elif a.get('status') == 'closed':
-                actual_info = f" |实际:已平仓"
+                actual_info = f" |{_position_source_label(a)}:已平仓"
 
-        print(f"  {_pad(h['name'], 14)} {_pad(h['code'], 8)} T+{display_days:>3} "
-              f"{bp:>8} {cp:>8} {pnl:>8} {exit_str:>10} {tags}{actual_info}")
+        row = {
+            'name': h['name'],
+            'code': h['code'],
+            'days': display_days,
+            'buy_price': bp,
+            'current_price': cp,
+            'pnl': pnl,
+            'exit_str': exit_str,
+            'tags': tags + actual_info,
+        }
+        print("  " + " ".join(_hold_row_cells(row)))
 
 
 def mode_compare(cache, stock_code):
@@ -971,14 +1192,16 @@ def mode_compare(cache, stock_code):
             print(f"    因子: {factor_str}")
 
     if actual:
-        print(f"\n  📊 实际操作:")
+        section_title = "模拟持仓" if actual.get('source') == 'backfill' else "实际操作"
+        print(f"\n  📊 {section_title}:")
+        pnl_label = "模拟收益" if section_title == "模拟持仓" else "实际收益"
         print(f"    买入日: {actual.get('actual_buy_date') or '--'}")
         print(f"    买入价: {actual.get('actual_buy_price') or '--'}")
         print(f"    卖出日: {actual.get('actual_sell_date') or '--'}")
         print(f"    卖出价: {actual.get('actual_sell_price') or '--'}")
         print(f"    持仓天数: {actual.get('hold_days') or '--'}")
         rp = actual.get('return_pct')
-        print(f"    实际收益: {rp:+.2f}%" if rp is not None else "    实际收益: --")
+        print(f"    {pnl_label}: {rp:+.2f}%" if rp is not None else f"    {pnl_label}: --")
         print(f"    状态: {actual.get('status') or '--'}")
 
     if comparison:

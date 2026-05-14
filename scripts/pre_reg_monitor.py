@@ -18,6 +18,7 @@
 
 用法:
   --scan                    扫描今日注册前信号（需集思录实时数据）
+  --hold                    查看模拟持仓与持仓监控
   --backtest                历史回测（所有已注册转债）
   --backtest --limit 100    指定样本数
   --backtest --strategy mom_recover  指定策略
@@ -26,6 +27,7 @@ import sys, os, re, math
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lib.backtest_cache import BacktestCache
+from lib.monitor_db import MonitorDB
 
 
 # ========== 策略定义 ==========
@@ -106,32 +108,45 @@ def find_idx(dates, target):
     return result
 
 
-def calc_factors_at(closes, volumes, idx):
-    """计算 idx 日收盘后的策略因子（仅使用 idx 及之前数据，无 look-ahead bias）"""
-    if idx < 22:
+def calc_factors_at(closes, volumes, idx, dates=None, as_of_date=None):
+    """计算 idx 日收盘后的策略因子。
+
+    盘中若 idx 对应当天最新未收盘交易日，则自动回退到上一完整交易日。
+    """
+    factor_idx = idx
+    if dates and as_of_date and idx < len(dates) and dates[idx] == as_of_date and idx > 0:
+        factor_idx = idx - 1
+
+    if factor_idx < 22:
         return None
 
-    t1, t3, t5, t10, t20 = closes[idx - 1], closes[idx - 3], closes[idx - 5], closes[idx - 10], closes[idx - 20]
+    t1, t3, t5, t10, t20 = (
+        closes[factor_idx - 1],
+        closes[factor_idx - 3],
+        closes[factor_idx - 5],
+        closes[factor_idx - 10],
+        closes[factor_idx - 20],
+    )
     pre3 = ((t1 - t3) / t3 * 100) if t3 > 0 else 0
     pre5 = ((t1 - t5) / t5 * 100) if t5 > 0 else 0
     mom10 = ((t1 - t10) / t10 * 100) if t10 > 0 else 0
     mom20 = ((t1 - t20) / t20 * 100) if t20 > 0 else 0
 
-    vol_t = volumes[idx]
-    avg5 = sum(volumes[idx - 5:idx]) / 5
+    vol_t = volumes[factor_idx]
+    avg5 = sum(volumes[factor_idx - 5:factor_idx]) / 5
     vol5 = vol_t / avg5 if avg5 > 0 else 1.0
-    avg10 = sum(volumes[idx - 10:idx]) / 10 if idx >= 10 else avg5
+    avg10 = sum(volumes[factor_idx - 10:factor_idx]) / 10 if factor_idx >= 10 else avg5
     vol10 = vol_t / avg10 if avg10 > 0 else 1.0
 
-    cdown = sum(1 for i in range(idx, 0, -1) if closes[i] < closes[i - 1])
-    cup = sum(1 for i in range(idx, 0, -1) if closes[i] >= closes[i - 1])
+    cdown = sum(1 for i in range(factor_idx, 0, -1) if closes[i] < closes[i - 1])
+    cup = sum(1 for i in range(factor_idx, 0, -1) if closes[i] >= closes[i - 1])
 
-    ma5 = sum(closes[idx - 5:idx]) / 5
-    ma5p = (closes[idx] / ma5 - 1) * 100
-    ma10 = sum(closes[idx - 10:idx]) / 10
-    ma10p = (closes[idx] / ma10 - 1) * 100
-    ma20 = sum(closes[idx - 20:idx]) / 20
-    ma20p = (closes[idx] / ma20 - 1) * 100
+    ma5 = sum(closes[factor_idx - 5:factor_idx]) / 5
+    ma5p = (closes[factor_idx] / ma5 - 1) * 100
+    ma10 = sum(closes[factor_idx - 10:factor_idx]) / 10
+    ma10p = (closes[factor_idx] / ma10 - 1) * 100
+    ma20 = sum(closes[factor_idx - 20:factor_idx]) / 20
+    ma20p = (closes[factor_idx] / ma20 - 1) * 100
 
     return {
         'pre3': pre3, 'pre5': pre5, 'mom10': mom10, 'mom20': mom20,
@@ -208,6 +223,65 @@ def detect_sell_signals(closes, buy_idx, reg_idx):
             'max_gain': max_gain}
 
 
+def parse_exit_thresholds(exit_str):
+    """解析退出配置，返回 (tp, sl) 百分比阈值"""
+    if not exit_str:
+        return 5, 5
+    exit_str = exit_str.upper().replace(' ', '')
+    tp_m = re.search(r'TP(\d+)', exit_str)
+    sl_m = re.search(r'SL(\d+)', exit_str)
+    tp = int(tp_m.group(1)) if tp_m else 5
+    sl = int(sl_m.group(1)) if sl_m else 5
+    return tp, sl
+
+
+def _first_triggered_strategy(triggered):
+    """返回首次命中的策略 key"""
+    for s in PRE_REG_STRATEGIES:
+        if triggered.get(s.key):
+            return s.key
+    return None
+
+
+def _hold_display_parts(factors, triggered):
+    """生成持仓展示所需的统一字段"""
+    bp = f"{factors['buy_price']:.2f}" if factors.get('buy_price') else '--'
+    cp = f"{factors['current_close']:.2f}" if factors.get('current_close') else '--'
+    pnl = f"{factors['pnl_pct']:+.1f}%" if factors.get('pnl_pct') is not None else '--'
+
+    tp_val, sl_val = 5, 5
+    exit_label = 'REG'
+    first_key = _first_triggered_strategy(triggered)
+    if first_key:
+        s = next((x for x in PRE_REG_STRATEGIES if x.key == first_key), None)
+        if s:
+            tp_val, sl_val = parse_exit_thresholds(s.best_exit)
+            exit_label = s.best_exit or 'REG'
+
+    pnl_val = factors.get('pnl_pct')
+    tp_mark = '✅' if pnl_val is not None and pnl_val >= tp_val else ' '
+    sl_mark = '⚠️' if pnl_val is not None and pnl_val <= -sl_val else ' '
+    exit_str = f"{tp_mark}{sl_mark} ({exit_label})"
+
+    tags = ' '.join(s.display_name for s in PRE_REG_STRATEGIES if triggered.get(s.key))
+
+    return {
+        'buy_price': bp,
+        'current_price': cp,
+        'pnl': pnl,
+        'exit_str': exit_str,
+        'tags': tags,
+    }
+
+
+def _format_t_plus(days, width=6):
+    """格式化 T+N，避免 T+ 后面出现多余空格"""
+    try:
+        return _pad(f"T+{int(days)}", width)
+    except (TypeError, ValueError):
+        return _pad('--', width)
+
+
 # ========== 回测引擎 ==========
 
 def scan_daily_factors(closes, volumes, dates, ti, ri):
@@ -218,6 +292,79 @@ def scan_daily_factors(closes, volumes, dates, ti, ri):
         if f:
             factor_map[idx] = f
     return factor_map
+
+
+def find_first_signal(closes, volumes, dates, ti, ri, strategies, as_of_date=None):
+    """找出首次触发策略的交易日"""
+    first_idx = None
+    first_factors = None
+    first_triggered = None
+    for idx in range(ti + SCAN_START, ri):
+        f = calc_factors_at(closes, volumes, idx, dates=dates, as_of_date=as_of_date)
+        if not f:
+            continue
+        triggered = {s.key: s.matches(f) for s in strategies}
+        if any(triggered.values()):
+            first_idx = idx
+            first_factors = f
+            first_triggered = triggered
+            break
+    return first_idx, first_factors, first_triggered
+
+
+def simulate_exit(dates, closes, buy_idx, reg_idx):
+    """按回测规则模拟退出点"""
+    if buy_idx is None or reg_idx is None or reg_idx <= buy_idx:
+        return None, None, None
+
+    tp_hit = None
+    sl_hit = None
+    for idx in range(buy_idx + 1, min(reg_idx + 2, len(closes))):
+        daily_ret = (closes[idx] / closes[buy_idx] - 1) * 100 if closes[buy_idx] > 0 else 0
+        if daily_ret >= TP and tp_hit is None:
+            tp_hit = idx
+        if daily_ret <= SL and sl_hit is None:
+            sl_hit = idx
+
+    sell_idx = reg_idx + 1 if reg_idx + 1 < len(dates) else None
+    sell_reason = 'REG'
+    if sl_hit is not None and sl_hit > buy_idx and (sell_idx is None or sl_hit < sell_idx):
+        sell_idx = min(sl_hit + 1, len(dates) - 1)
+        sell_reason = 'SL'
+    elif tp_hit is not None and tp_hit > buy_idx and (sell_idx is None or tp_hit < sell_idx):
+        sell_idx = min(tp_hit + 1, len(dates) - 1)
+        sell_reason = 'TP'
+
+    if sell_idx is None:
+        return None, None, None
+    return sell_idx, sell_reason, closes[sell_idx]
+
+
+def _hold_row_cells(row):
+    """统一持仓行输出"""
+    return [
+        _pad(row['name'], 14),
+        _pad(row['code'], 8),
+        _format_t_plus(row['days'], 6),
+        _pad(row['buy_price'], 8),
+        _pad(row['current_price'], 8),
+        _pad(row['pnl'], 8),
+        _pad(row['exit_str'], 14),
+        row['tags'],
+    ]
+
+
+def print_hold_table(title, rows):
+    """打印持仓表"""
+    print(f"\n  📊 {title} ({len(rows)}只):")
+    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('T+', 6)} {_pad('买价', 8)} {_pad('现价', 8)} {_pad('盈亏', 8)} {_pad('止盈止损', 14)} {'触发策略'}"
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
+    if not rows:
+        print("  无持仓")
+        return
+    for row in rows:
+        print("  " + " ".join(_hold_row_cells(row)))
 
 
 def build_backtest_pool(cache, strategies, check_interval=2):
@@ -596,13 +743,9 @@ def get_pipeline_bonds(cache):
     return pipeline
 
 
-def mode_scan(cache, strategies):
-    """扫描今日注册前信号 + 持仓卖出信号"""
+def build_monitor_pool(cache, strategies):
+    """构建监控池，并附带首次信号与模拟持仓状态"""
     today_str = datetime.now().strftime('%Y-%m-%d')
-    print(f"\n{'=' * 110}")
-    print(f'注册前信号监控 — {today_str}')
-    print(f'{"=" * 110}')
-
     from datetime import date as date_cls
     parts = today_str.split('-')
     today_date = date_cls(int(parts[0]), int(parts[1]), int(parts[2]))
@@ -612,7 +755,8 @@ def mode_scan(cache, strategies):
 
     for b in pipeline:
         sc = b.get('stock_code')
-        if not sc: continue
+        if not sc:
+            continue
 
         pf = b.get('progress_full', '')
         tongguo_date = ''
@@ -620,36 +764,65 @@ def mode_scan(cache, strategies):
             for line in pf.replace('<br>', '\n').split('\n'):
                 if '上市委通过' in line:
                     m = re.search(r'(\d{4}-\d{2}-\d{2})', line)
-                    if m: tongguo_date = m.group(1)
+                    if m:
+                        tongguo_date = m.group(1)
                     break
 
         klines = cache.get_kline_as_dict(sc, days=1500)
-        if not klines: continue
+        if not klines:
+            continue
         dates = sorted(klines.keys())
-        if len(dates) < 25: continue
+        if len(dates) < 25:
+            continue
 
         closes = [klines[d]['close'] for d in dates]
         volumes = [klines[d].get('volume', 0) for d in dates]
+        opens = [klines[d].get('open', klines[d]['close']) for d in dates]
         today_idx = find_idx(dates, today_str)
-        factors = calc_factors_at(closes, volumes, today_idx)
-        if not factors: continue
-        current = klines[dates[today_idx]]
+        if today_idx is None:
+            continue
 
-        # 首次信号日期
-        first_signal_date = ''
+        current_idx = today_idx
+        if dates[today_idx] == today_str and today_idx > 0:
+            current_idx = today_idx - 1
+
+        factors = calc_factors_at(closes, volumes, current_idx, dates=dates, as_of_date=today_str)
+        if not factors:
+            continue
+        current = klines[dates[current_idx]]
+
+        # 首次信号
+        first_signal_idx, first_signal_factors, first_signal_triggered = None, None, None
         scan_started = False
+        buy_idx = None
+        buy_date = ''
+        buy_price = None
         if tongguo_date:
             ti = find_idx(dates, tongguo_date)
             scan_started = (today_idx >= ti + SCAN_START)
-            if scan_started:
-                for idx in range(ti + SCAN_START, today_idx + 1):
-                    sf = calc_factors_at(closes, volumes, idx)
-                    if not sf: continue
-                    for s in strategies:
-                        if s.matches(sf):
-                            first_signal_date = dates[idx]
-                            break
-                    if first_signal_date: break
+            if ti >= 0:
+                first_signal_idx, first_signal_factors, first_signal_triggered = find_first_signal(
+                    closes, volumes, dates, ti, today_idx + 1, strategies, as_of_date=today_str
+                )
+                if first_signal_idx is not None:
+                    buy_idx = first_signal_idx + 1
+                    if buy_idx < len(dates):
+                        buy_date = dates[buy_idx]
+                        buy_price = opens[buy_idx] if opens[buy_idx] > 0 else closes[buy_idx]
+
+        first_signal_date = dates[first_signal_idx] if first_signal_idx is not None else ''
+        first_signal_labels = [s.display_name for s in strategies if first_signal_triggered and first_signal_triggered.get(s.key)] if first_signal_triggered else []
+
+        # 模拟退出
+        sim_sell_idx = sim_sell_reason = None
+        sim_sell_price = None
+        if buy_idx is not None and buy_idx < len(dates) and tongguo_date:
+            ri = find_idx(dates, tongguo_date)
+            sim_sell_idx, sim_sell_reason, sim_sell_price = simulate_exit(dates, closes, buy_idx, ri)
+
+        current_pnl = None
+        if buy_price and buy_price > 0 and current['close'] > 0:
+            current_pnl = ((current['close'] - buy_price) / buy_price) * 100
 
         # 自然天
         days_natural = ''
@@ -662,23 +835,155 @@ def mode_scan(cache, strategies):
         trading_days = ''
         if tongguo_date:
             ti = find_idx(dates, tongguo_date)
-            trading_days = f"D+{today_idx - ti}"
+            trading_days = f"T+{current_idx - ti}"
 
-        # 检查今日策略触发
+        # 今日策略触发
         triggered = {s.key: s.matches(factors) for s in strategies}
 
         pool_data.append({
             'code': sc,
             'name': (b.get('bond_name') or b.get('stock_nm') or '?')[:12],
             'close': current['close'],
+            'dates': dates,
             'factors': factors,
             'tongguo_date': tongguo_date,
             'days_natural': days_natural,
             'trading_days': trading_days,
             'first_signal_date': first_signal_date,
+            'first_signal_idx': first_signal_idx,
+            'first_signal_factors': first_signal_factors or {},
+            'first_signal_triggered': first_signal_triggered or {},
+            'first_signal_labels': first_signal_labels,
+            'buy_idx': buy_idx,
+            'buy_date': buy_date,
+            'buy_price': buy_price,
+            'sell_date': dates[sim_sell_idx] if sim_sell_idx is not None and sim_sell_idx < len(dates) else '',
+            'sim_sell_idx': sim_sell_idx,
+            'sim_sell_reason': sim_sell_reason,
+            'sim_sell_price': sim_sell_price,
+            'current_pnl': current_pnl,
             'triggered': triggered,
             'scan_started': scan_started,
         })
+
+    return pool_data
+
+
+def sync_simulated_positions(db, pool_data):
+    """同步模拟持仓到数据库，首次信号生效，后续不覆盖"""
+    existing = {p['stock_code']: p for p in db.get_backfill_positions()}
+    created = 0
+    closed = 0
+
+    for item in pool_data:
+        if not item.get('buy_date') or not item.get('buy_price'):
+            continue
+
+        sc = item['code']
+        pos = existing.get(sc)
+
+        payload = {
+            'stock_name': item.get('name', ''),
+            'bond_code': '',
+            'bond_name': item.get('name', ''),
+            'theory_buy_date': item['buy_date'],
+            'theory_buy_price': item['buy_price'],
+            'triggered_strategies': list(item.get('first_signal_triggered', {}).keys()),
+            'strategy_labels': item.get('first_signal_labels', []),
+            'theory_exit_type': item.get('sim_sell_reason') or 'REG',
+            'theory_factors': item.get('first_signal_factors', {}) or {},
+        }
+
+        if not pos:
+            create_result = db.upsert_simulated_position(sc, item.get('tongguo_date', ''), payload)
+            created += 1
+            pos = {'position_id': create_result.get('position_id')}
+        else:
+            pos = dict(pos)
+
+        if not pos or pos.get('status') == 'closed':
+            continue
+
+        if item.get('sim_sell_idx') is not None and item.get('sim_sell_price') is not None:
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            sell_date = item.get('sell_date', '')
+            if sell_date and sell_date <= today_str:
+                db.execute_sell(
+                    pos['position_id'],
+                    sell_date,
+                    item['sim_sell_price'],
+                    item.get('sim_sell_reason') or 'REG'
+                )
+                closed += 1
+
+    return {'created': created, 'closed': closed}
+
+
+def build_simulated_hold_rows(pool_data, db, active_only=True):
+    """从数据库 + 监控池构建模拟持仓行"""
+    pool_map = {item['code']: item for item in pool_data}
+    rows = []
+    for pos in db.get_backfill_positions():
+        if pos.get('status') not in ('active', 'closed'):
+            continue
+        if active_only and pos.get('status') != 'active':
+            continue
+
+        item = pool_map.get(pos.get('stock_code'))
+        if not item:
+            continue
+
+        if pos.get('status') == 'closed':
+            buy_price = f"{pos.get('actual_buy_price'):.2f}" if pos.get('actual_buy_price') else '--'
+            current_price = f"{pos.get('actual_sell_price'):.2f}" if pos.get('actual_sell_price') else '--'
+            pnl = f"{pos.get('return_pct', 0):+.1f}%" if pos.get('return_pct') is not None else '--'
+            exit_str = f"已平仓({pos.get('sell_reason') or 'REG'})"
+            tags = ' '.join(item.get('first_signal_labels', []))
+        else:
+            factors = {
+                'buy_price': item.get('buy_price'),
+                'current_close': item.get('close'),
+                'pnl_pct': item.get('current_pnl'),
+            }
+            parts = _hold_display_parts(factors, item.get('first_signal_triggered', {}))
+            buy_price = f"{item['buy_price']:.2f}" if item.get('buy_price') else '--'
+            current_price = f"{item['close']:.2f}" if item.get('close') else '--'
+            pnl = parts['pnl']
+            exit_str = parts['exit_str']
+            tags = parts['tags']
+
+        rows.append({
+            'name': item['name'],
+            'code': item['code'],
+            'days': item.get('trading_days') or '--',
+            'buy_price': buy_price,
+            'current_price': current_price,
+            'pnl': pnl,
+            'exit_str': exit_str,
+            'tags': tags,
+            'status': pos.get('status') or '--',
+        })
+
+    def _day_key(v):
+        m = re.search(r'(\d+)', str(v))
+        return int(m.group(1)) if m else 9999
+
+    rows.sort(key=lambda x: _day_key(x['days']))
+    return rows
+
+
+def mode_scan(cache, strategies):
+    """扫描今日注册前信号 + 同步模拟持仓"""
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    print(f"\n{'=' * 110}")
+    print(f'注册前信号监控 — {today_str}')
+    print(f'{"=" * 110}')
+
+    pool_data = build_monitor_pool(cache, strategies)
+    db = MonitorDB()
+    sync_stats = sync_simulated_positions(db, pool_data)
+    if sync_stats['created'] or sync_stats['closed']:
+        print(f"  同步模拟持仓: 新建{sync_stats['created']} 条, 平仓{sync_stats['closed']} 条")
 
     # 买入信号 (仅在进入扫描窗口后)
     buy_signals = [d for d in pool_data if any(d['triggered'].values()) and d.get('scan_started', False)]
@@ -719,7 +1024,7 @@ def mode_scan(cache, strategies):
 
     # 监控池
     print(f"\n  监控池 ({len(pool_data)} 只):")
-    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('收盘', 8)} {_pad('上市委通过', 16)} {_pad('D+', 6)} {_pad('首次信号', 16)} {_pad('pre3', 7)} {_pad('pre5', 7)} {_pad('mom10', 8)} {_pad('vol5', 5)} 信号"
+    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('收盘', 8)} {_pad('上市委通过', 16)} {_pad('T+', 6)} {_pad('首次信号', 16)} {_pad('pre3', 7)} {_pad('pre5', 7)} {_pad('mom10', 8)} {_pad('vol5', 5)} 信号"
     print(hdr)
     print("  " + "-" * 122)
     for item in pool_data:
@@ -738,6 +1043,10 @@ def mode_scan(cache, strategies):
         row = f"  {_pad(item['name'], 14)} {_pad(item['code'], 8)} {_pad(c, 8)} {_pad(tg, 16)} {_pad(item['trading_days'], 6)} {_pad(fs, 16)} {_pad(p3, 7)} {_pad(p5, 7)} {_pad(m10, 8)} {_pad(v5, 5)} {sig_tag}"
         print(row)
 
+    # 模拟持仓
+    sim_rows = build_simulated_hold_rows(pool_data, db, active_only=True)
+    print_hold_table("模拟持仓", sim_rows)
+
     # 策略说明
     print(f"\n  因子说明:")
     print(f"    pre3  = 距今日3个交易日的跌幅 (T-3 至 T-1 收盘价涨幅)")
@@ -750,6 +1059,23 @@ def mode_scan(cache, strategies):
         print(f"    {s.display_name}: {s.label}  (exit={s.best_exit}, 胜={s.win_rate}, 年化={s.annual})")
     print(f"  卖出: TP +{TP}% / SL {SL}%（持仓期间每日盯市，触发次日卖出）")
     print(f"  买入窗口: 上市委通过 D+{SCAN_START} 起")
+
+
+def mode_hold(cache, strategies):
+    """持仓监控"""
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    print(f"\n{'=' * 110}")
+    print(f'注册前持仓监控 — {today_str}')
+    print(f'{"=" * 110}')
+
+    pool_data = build_monitor_pool(cache, strategies)
+    db = MonitorDB()
+    sync_stats = sync_simulated_positions(db, pool_data)
+    if sync_stats['created'] or sync_stats['closed']:
+        print(f"  同步模拟持仓: 新建{sync_stats['created']} 条, 平仓{sync_stats['closed']} 条")
+
+    hold_rows = build_simulated_hold_rows(pool_data, db, active_only=False)
+    print_hold_table("持仓监控", hold_rows)
 
 
 def mode_backtest(cache, strategies, limit=None):
@@ -784,6 +1110,7 @@ def mode_backtest(cache, strategies, limit=None):
 def main():
     cache = BacktestCache()
     args = sys.argv[1:]
+    mode = 'scan'
     is_backtest = False
     limit = None
     strategy_key = None
@@ -791,6 +1118,10 @@ def main():
     i = 0
     while i < len(args):
         if args[i] == '--scan':
+            mode = 'scan'
+            i += 1
+        elif args[i] == '--hold':
+            mode = 'hold'
             i += 1
         elif args[i] == '--backtest':
             is_backtest = True
@@ -817,7 +1148,10 @@ def main():
         mode_backtest(cache, strategies, limit)
     else:
         cache.ensure_jisilu_data_for_today()
-        mode_scan(cache, strategies)
+        if mode == 'hold':
+            mode_hold(cache, strategies)
+        else:
+            mode_scan(cache, strategies)
 
 
 if __name__ == '__main__':
