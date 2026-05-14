@@ -17,7 +17,7 @@ A 股可转债分析工具库
 
 __version__ = '1.0.0'
 
-from .data_source import EastmoneyAPI, SinaFinanceAPI
+from .data_source import EastmoneyAPI, BaoStockAPI
 from .bond_calculator import BondCalculator, QuequanAnalysis
 from .report import ReportGenerator
 from .backtest_cache import BacktestCache
@@ -25,7 +25,7 @@ from .monitor_db import MonitorDB
 
 __all__ = [
     'EastmoneyAPI',
-    'SinaFinanceAPI',
+    'BaoStockAPI',
     'BondCalculator',
     'QuequanAnalysis',
     'ReportGenerator',

@@ -122,6 +122,7 @@ class MonitorDB:
                     bond_code TEXT,
                     bond_name TEXT,
                     registration_date TEXT NOT NULL,
+                    first_signal_date TEXT,
                     triggered_strategies TEXT DEFAULT '[]',
                     strategy_labels TEXT DEFAULT '[]',
                     calendar_diff INTEGER,
@@ -149,6 +150,7 @@ class MonitorDB:
 
         # 迁移旧表：如果缺少 source 字段则添加
         self._migrate_add_source_column()
+        self._migrate_add_first_signal_date_column()
 
     def _migrate_add_source_column(self):
         with self._get_conn() as conn:
@@ -160,6 +162,14 @@ class MonitorDB:
                     UPDATE positions SET source = 'backfill'
                     WHERE source IS NULL OR source = ''
                 ''')
+                conn.commit()
+
+    def _migrate_add_first_signal_date_column(self):
+        with self._get_conn() as conn:
+            columns = conn.execute('PRAGMA table_info(theory_signals)').fetchall()
+            has_first_signal_date = any(col['name'] == 'first_signal_date' for col in columns)
+            if not has_first_signal_date:
+                conn.execute('ALTER TABLE theory_signals ADD COLUMN first_signal_date TEXT')
                 conn.commit()
 
     # ============================================================
@@ -174,6 +184,7 @@ class MonitorDB:
         Args:
             data: {
                 stock_name, bond_code, bond_name,
+                first_signal_date: '2026-05-12',
                 triggered_strategies: ['broad_momentum', 'reversal_end'],
                 strategy_labels: ['宽幅动量信号', '回调结束企稳'],
                 calendar_diff: 5,
@@ -192,16 +203,18 @@ class MonitorDB:
                 conn.execute('''
                     INSERT INTO theory_signals
                         (stock_code, stock_name, bond_code, bond_name, registration_date,
+                         first_signal_date,
                          triggered_strategies, strategy_labels, calendar_diff, trading_days,
                          theory_buy_date, theory_buy_price, theory_exit_type,
                          theory_factors, theory_pnl_pct, current_price, current_date)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     stock_code,
                     data.get('stock_name', ''),
                     data.get('bond_code', ''),
                     data.get('bond_name', ''),
                     registration_date,
+                    data.get('first_signal_date', ''),
                     json.dumps(data.get('triggered_strategies', []), ensure_ascii=False),
                     json.dumps(data.get('strategy_labels', []), ensure_ascii=False),
                     data.get('calendar_diff'),
@@ -218,6 +231,7 @@ class MonitorDB:
                 conn.execute('''
                     UPDATE theory_signals SET
                         stock_name = ?, bond_code = ?, bond_name = ?,
+                        first_signal_date = ?,
                         triggered_strategies = ?, strategy_labels = ?,
                         calendar_diff = ?, trading_days = ?,
                         theory_buy_date = ?, theory_buy_price = ?, theory_exit_type = ?,
@@ -228,6 +242,7 @@ class MonitorDB:
                     data.get('stock_name', ''),
                     data.get('bond_code', ''),
                     data.get('bond_name', ''),
+                    data.get('first_signal_date', ''),
                     json.dumps(data.get('triggered_strategies', []), ensure_ascii=False),
                     json.dumps(data.get('strategy_labels', []), ensure_ascii=False),
                     data.get('calendar_diff'),
@@ -270,12 +285,30 @@ class MonitorDB:
             conn.commit()
 
     def record_actual_buy(self, stock_code: str, buy_date: str, buy_price: float,
-                          registration_date: str = None, stock_name: str = '') -> None:
+                          registration_date: str = None, stock_name: str = '',
+                          first_signal_date: str = '',
+                          triggered_strategies: List[str] = None,
+                          strategy_labels: List[str] = None,
+                          sell_mode: str = 'TPSL',
+                          buy_reason: str = '用户手动录入',
+                          notes: str = '') -> None:
         """
         记录实际买入（与理论信号独立，用户手动操作）
         如果已有该 code+date 的 position 记录则更新，否则新建
         """
         pos_id = f"{stock_code}_{registration_date.replace('-', '')}" if registration_date else f"{stock_code}_{buy_date.replace('-', '')}"
+        triggered_strategies = triggered_strategies or []
+        strategy_labels = strategy_labels or []
+        note_payload = {
+            'origin': 'actual',
+            'first_signal_date': first_signal_date or '',
+            'sell_mode': sell_mode or 'TPSL',
+            'triggered_strategies': triggered_strategies,
+            'strategy_labels': strategy_labels,
+            'buy_reason': buy_reason or '用户手动录入',
+            'user_notes': notes or '',
+            'recorded_at': datetime.now().isoformat(),
+        }
 
         with self._get_conn() as conn:
             # 先查是否已有
@@ -287,18 +320,21 @@ class MonitorDB:
                 conn.execute('''
                     UPDATE positions SET
                         actual_buy_date = ?, actual_buy_price = ?,
+                        buy_reason = ?, notes = ?,
                         status = 'active', updated_at = CURRENT_TIMESTAMP
                     WHERE position_id = ?
-                ''', (buy_date, buy_price, pos_id))
+                ''', (buy_date, buy_price, buy_reason,
+                      json.dumps(note_payload, ensure_ascii=False), pos_id))
             else:
                 conn.execute('''
                     INSERT INTO positions
                         (position_id, stock_code, stock_name, registration_date,
-                         actual_buy_date, actual_buy_price, status, source, buy_reason)
-                    VALUES (?, ?, ?, ?, ?, ?, 'active', 'manual', '用户手动录入')
+                         actual_buy_date, actual_buy_price, status, source, buy_reason, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, 'active', 'manual', ?, ?)
                 ''', (pos_id, stock_code, stock_name,
                       registration_date or '',
-                      buy_date, buy_price))
+                      buy_date, buy_price, buy_reason,
+                      json.dumps(note_payload, ensure_ascii=False)))
             conn.commit()
 
     def record_actual_sell(self, stock_code: str, sell_date: str, sell_price: float,
@@ -368,6 +404,8 @@ class MonitorDB:
             labels = data.get('strategy_labels', [])
             notes = {
                 'origin': 'simulated',
+                'monitor_script': data.get('monitor_script', ''),
+                'first_signal_date': data.get('first_signal_date', ''),
                 'triggered_strategies': triggered,
                 'strategy_labels': labels,
                 'theory_exit_type': data.get('theory_exit_type', ''),
@@ -436,6 +474,12 @@ class MonitorDB:
                 t['triggered_strategies'] = json.loads(t.get('triggered_strategies', '[]'))
                 t['strategy_labels'] = json.loads(t.get('strategy_labels', '[]'))
                 t['theory_factors'] = json.loads(t.get('theory_factors', '{}'))
+
+            if a:
+                try:
+                    a['notes_data'] = json.loads(a.get('notes') or '{}')
+                except (TypeError, ValueError):
+                    a['notes_data'] = {}
 
             comparison = None
             if t and a and a.get('actual_buy_price') and a.get('actual_sell_price'):

@@ -22,8 +22,10 @@
   --backtest                历史回测（所有已注册转债）
   --backtest --limit 100    指定样本数
   --backtest --strategy mom_recover  指定策略
+  --buy CODE DATE PRICE [REG_DATE]   记录实际买入
+  --sell CODE DATE PRICE [REG_DATE]  记录实际卖出
 """
-import sys, os, re, math
+import sys, os, re, math, json
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lib.backtest_cache import BacktestCache
@@ -274,12 +276,50 @@ def _hold_display_parts(factors, triggered):
     }
 
 
+def _actual_sell_alert(current_price, buy_price, tp=5, sl=5):
+    """根据实际持仓现价和买价生成卖出提醒"""
+    try:
+        buy_price = float(buy_price)
+        current_price = float(current_price)
+    except (TypeError, ValueError):
+        return '持仓中'
+
+    if buy_price <= 0 or current_price <= 0:
+        return '持仓中'
+
+    pnl_pct = (current_price / buy_price - 1) * 100
+    if pnl_pct >= tp:
+        return f'卖出信号(TP+{tp}%)'
+    if pnl_pct <= -sl:
+        return f'卖出信号(SL-{sl}%)'
+    return '持仓中'
+
+
 def _format_t_plus(days, width=6):
     """格式化 T+N，避免 T+ 后面出现多余空格"""
     try:
         return _pad(f"T+{int(days)}", width)
     except (TypeError, ValueError):
         return _pad('--', width)
+
+
+def _labels_text(labels, default='—'):
+    """把策略标签压成展示文本"""
+    if not labels:
+        return default
+    if isinstance(labels, str):
+        text = labels.strip()
+        return text or default
+    items = [str(x).strip() for x in labels if str(x).strip()]
+    return '/'.join(items) if items else default
+
+
+def _strategy_conclusion_text(strategies):
+    """根据当前回测结论生成策略排序摘要"""
+    names = [s.display_name for s in strategies]
+    if {'动量恢复', '高胜率', 'MA5过滤'}.issubset(set(names)):
+        return '结论(当前历史回测): MA5过滤 > 高胜率 > 动量恢复；优先保留 MA5过滤，高胜率次选，动量恢复观察。'
+    return '结论(当前历史回测): 请以回测排序表为准，优先保留夏普更高、平均亏损更小且年份更稳定的策略。'
 
 
 # ========== 回测引擎 ==========
@@ -349,7 +389,7 @@ def _hold_row_cells(row):
         _pad(row['buy_price'], 8),
         _pad(row['current_price'], 8),
         _pad(row['pnl'], 8),
-        _pad(row['exit_str'], 14),
+        _pad(row['exit_str'], 24),
         row['tags'],
     ]
 
@@ -357,7 +397,7 @@ def _hold_row_cells(row):
 def print_hold_table(title, rows):
     """打印持仓表"""
     print(f"\n  📊 {title} ({len(rows)}只):")
-    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('T+', 6)} {_pad('买价', 8)} {_pad('现价', 8)} {_pad('盈亏', 8)} {_pad('止盈止损', 14)} {'触发策略'}"
+    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('T+', 6)} {_pad('买价', 8)} {_pad('现价', 8)} {_pad('盈亏', 8)} {_pad('止盈止损', 24)} {'触发策略'}"
     print(hdr)
     print("  " + "-" * (_dw(hdr) - 2))
     if not rows:
@@ -365,6 +405,91 @@ def print_hold_table(title, rows):
         return
     for row in rows:
         print("  " + " ".join(_hold_row_cells(row)))
+
+
+def resolve_stock_name(stock_code, reg_date=None):
+    """根据股票代码解析名称，优先按注册日精确匹配"""
+    db = MonitorDB()
+    if reg_date:
+        with db._get_conn() as conn:
+            row = conn.execute(
+                "SELECT stock_name FROM registration_events WHERE stock_code = ? AND registration_date = ?",
+                (stock_code, reg_date)
+            ).fetchone()
+            if row and row['stock_name']:
+                return (row['stock_name'] or '')[:12]
+
+    event = db.get_registration_by_stock(stock_code)
+    if event and event.get('stock_name'):
+        return (event['stock_name'] or '')[:12]
+    return ''
+
+
+def resolve_actual_signal_meta(cache, strategies, stock_code, reg_date=None):
+    """为实际买入解析触发策略信息"""
+    db = MonitorDB()
+
+    pool_data = build_monitor_pool(cache, strategies)
+    item = next((x for x in pool_data if x.get('code') == stock_code), None)
+    if item:
+        triggered = item.get('first_signal_triggered', {}) or {}
+        labels = item.get('first_signal_labels', []) or []
+        if any(triggered.values()) or labels:
+            return (
+                list(triggered.keys()),
+                labels,
+                item.get('tongguo_date') or reg_date or '',
+                item.get('first_signal_date') or '',
+            )
+
+    theory_rows = db.get_theory_signals(stock_code)
+    if theory_rows:
+        theory = theory_rows[0]
+        return (
+            theory.get('triggered_strategies', []) or [],
+            theory.get('strategy_labels', []) or [],
+            theory.get('registration_date') or reg_date or '',
+            theory.get('first_signal_date') or '',
+        )
+
+    return [], [], reg_date or '', ''
+
+
+def load_position_notes_data(pos):
+    """安全解析 positions.notes"""
+    try:
+        return json.loads(pos.get('notes') or '{}')
+    except (TypeError, ValueError):
+        return {}
+
+
+def _actual_sell_alert(current_price, buy_price, sell_mode='REG', registration_date=None):
+    """根据实际持仓的卖出模式生成卖出提醒"""
+    mode = (sell_mode or 'REG').upper()
+    if mode in ('REG', 'REG_ONLY', 'REGISTRATION'):
+        if registration_date:
+            try:
+                if datetime.now().strftime('%Y-%m-%d') >= registration_date:
+                    return '卖出信号(同意注册后卖出)'
+            except ValueError:
+                pass
+        return '持仓中'
+
+    try:
+        buy_price = float(buy_price)
+        current_price = float(current_price)
+    except (TypeError, ValueError):
+        return '持仓中'
+
+    if buy_price <= 0 or current_price <= 0:
+        return '持仓中'
+
+    pnl_pct = (current_price / buy_price - 1) * 100
+    if pnl_pct >= TP:
+        return f'卖出信号(TP+{TP}%)'
+    if pnl_pct <= SL:
+        return f'卖出信号(SL{SL}%)'
+    return '持仓中'
 
 
 def build_backtest_pool(cache, strategies, check_interval=2):
@@ -572,6 +697,75 @@ def print_backtest_report(pool, results, limit, strategies=None):
     if not results:
         print('\n  无触发样本')
         return
+
+    def _avg_loss(trades):
+        losses = [t['ret'] for t in trades if t['ret'] < 0]
+        return sum(losses) / len(losses) if losses else 0.0
+
+    ranking = []
+    for key, r in results.items():
+        s = r['strategy']
+        fixed = r['fixed']
+        tp_sl = r['tp_sl']
+        triggered = [p for p in pool if p.get('strategy_key') == key]
+        tp_sl_trades = [{'ret': t['tp_sl_ret'], 'hold_days': t['tp_sl_hold']} for t in triggered]
+        ranking.append({
+            'key': key,
+            'name': s.display_name,
+            'fixed': fixed,
+            'tp_sl': tp_sl,
+            'fixed_avg_loss': _avg_loss(triggered),
+            'tp_sl_avg_loss': _avg_loss(tp_sl_trades),
+            'count': r['count'],
+            'by_year': r['by_year'],
+        })
+
+    def _stable_years(item):
+        vals = [v['sharpe'] for v in item['by_year'].values() if v and v.get('n', 0) >= 2]
+        if len(vals) < 2:
+            return 0.0
+        spread = max(vals) - min(vals)
+        # 越小越稳定，转成分数方便排序
+        return 1 / (1 + spread)
+
+    def _print_ranking(title, metric_key, avg_loss_key, tie_key):
+        rows = sorted(
+            ranking,
+            key=lambda x: (
+                x[metric_key]['sharpe'] if x[metric_key] else -999,
+                x[metric_key]['avg'] if x[metric_key] else -999,
+                _stable_years(x),
+                x[tie_key],
+            ),
+            reverse=True,
+        )
+        print(f'\n  策略排序 ({title})')
+        hdr = (
+            f"  {_pad('排序', 4)} {_pad('策略', 14)} {_pad('样本', 5)} "
+            f"{_pad('平均%', 7)} {_pad('胜率', 7)} {_pad('平均亏损', 9)} {_pad('夏普', 7)} "
+            f"{_pad('持有', 7)} {_pad('稳定性', 8)}"
+        )
+        print(hdr)
+        print("  " + "-" * (_dw(hdr) - 2))
+        for idx, item in enumerate(rows, 1):
+            stat = item[metric_key]
+            if not stat:
+                continue
+            stable = _stable_years(item)
+            avg_txt = f"{stat['avg']:+.1f}%"
+            win_txt = f"{stat['win']:.1f}%"
+            loss_txt = f"{item[avg_loss_key]:+.1f}%"
+            sh_txt = f"{stat['sharpe']:+.2f}"
+            hold_txt = f"{stat['avg_hold']:.1f}d"
+            stable_txt = f"{stable:.2f}"
+            print(
+                f"  {_pad(str(idx), 4)} {_pad(item['name'], 14)} {_pad(str(stat['n']), 5)} "
+                f"{_pad(avg_txt, 7)} {_pad(win_txt, 7)} {_pad(loss_txt, 9)} {_pad(sh_txt, 7)} "
+                f"{_pad(hold_txt, 7)} {_pad(stable_txt, 8)}"
+            )
+
+    _print_ranking('监控退出', 'fixed', 'fixed_avg_loss', 'count')
+    _print_ranking(f'TP{TP}%/SL{SL}%', 'tp_sl', 'tp_sl_avg_loss', 'count')
 
     # 策略对比 — 监控退出
     print(f'\n  策略对比 (监控退出: 发现同意注册后次日卖出)')
@@ -839,6 +1033,7 @@ def build_monitor_pool(cache, strategies):
 
         # 今日策略触发
         triggered = {s.key: s.matches(factors) for s in strategies}
+        current_labels = [s.display_name for s in strategies if triggered.get(s.key)]
 
         pool_data.append({
             'code': sc,
@@ -854,6 +1049,7 @@ def build_monitor_pool(cache, strategies):
             'first_signal_factors': first_signal_factors or {},
             'first_signal_triggered': first_signal_triggered or {},
             'first_signal_labels': first_signal_labels,
+            'current_labels': current_labels,
             'buy_idx': buy_idx,
             'buy_date': buy_date,
             'buy_price': buy_price,
@@ -886,6 +1082,8 @@ def sync_simulated_positions(db, pool_data):
             'stock_name': item.get('name', ''),
             'bond_code': '',
             'bond_name': item.get('name', ''),
+            'monitor_script': 'pre_reg_monitor',
+            'first_signal_date': item.get('first_signal_date', ''),
             'theory_buy_date': item['buy_date'],
             'theory_buy_price': item['buy_price'],
             'triggered_strategies': list(item.get('first_signal_triggered', {}).keys()),
@@ -932,36 +1130,104 @@ def build_simulated_hold_rows(pool_data, db, active_only=True):
         item = pool_map.get(pos.get('stock_code'))
         if not item:
             continue
+        notes_data = load_position_notes_data(pos)
+        first_labels = notes_data.get('strategy_labels', []) or item.get('first_signal_labels', []) or []
+        current_labels = item.get('current_labels', []) or []
+        reg_date = pos.get('registration_date') or item.get('tongguo_date') or ''
+        days = item.get('trading_days')
+        if not days and reg_date:
+            try:
+                days = f"T+{(datetime.now() - datetime.strptime(reg_date, '%Y-%m-%d')).days}"
+            except ValueError:
+                days = '--'
 
         if pos.get('status') == 'closed':
             buy_price = f"{pos.get('actual_buy_price'):.2f}" if pos.get('actual_buy_price') else '--'
             current_price = f"{pos.get('actual_sell_price'):.2f}" if pos.get('actual_sell_price') else '--'
             pnl = f"{pos.get('return_pct', 0):+.1f}%" if pos.get('return_pct') is not None else '--'
             exit_str = f"已平仓({pos.get('sell_reason') or 'REG'})"
-            tags = ' '.join(item.get('first_signal_labels', []))
+            tags = ' '.join(labels) if labels else '—'
         else:
-            factors = {
-                'buy_price': item.get('buy_price'),
-                'current_close': item.get('close'),
-                'pnl_pct': item.get('current_pnl'),
-            }
-            parts = _hold_display_parts(factors, item.get('first_signal_triggered', {}))
-            buy_price = f"{item['buy_price']:.2f}" if item.get('buy_price') else '--'
+            buy_price = f"{item['buy_price']:.2f}" if item.get('buy_price') else f"{pos.get('actual_buy_price'):.2f}" if pos.get('actual_buy_price') else '--'
             current_price = f"{item['close']:.2f}" if item.get('close') else '--'
-            pnl = parts['pnl']
-            exit_str = parts['exit_str']
-            tags = parts['tags']
+            pnl_val = item.get('current_pnl')
+            pnl = f"{pnl_val:+.1f}%" if pnl_val is not None else '--'
+            exit_str = '模拟持仓'
+            tags = f"首:{_labels_text(first_labels)} 今:{_labels_text(current_labels)}"
 
         rows.append({
             'name': item['name'],
             'code': item['code'],
-            'days': item.get('trading_days') or '--',
+            'days': days or '--',
             'buy_price': buy_price,
             'current_price': current_price,
             'pnl': pnl,
             'exit_str': exit_str,
             'tags': tags,
             'status': pos.get('status') or '--',
+        })
+
+    def _day_key(v):
+        m = re.search(r'(\d+)', str(v))
+        return int(m.group(1)) if m else 9999
+
+    rows.sort(key=lambda x: _day_key(x['days']))
+    return rows
+
+
+def build_actual_hold_rows(pool_data, db, active_only=True):
+    """从数据库 + 监控池构建实际持仓行"""
+    pool_map = {item['code']: item for item in pool_data}
+    backfill_map = {p['stock_code']: p for p in db.get_backfill_positions()}
+    rows = []
+    with db._get_conn() as conn:
+        query = """
+            SELECT * FROM positions
+            WHERE status = 'active'
+              AND source IN ('real', 'manual')
+        """
+        if active_only:
+            query += " ORDER BY actual_buy_date DESC, id DESC"
+        else:
+            query += " ORDER BY actual_buy_date DESC, id DESC"
+        positions = [dict(row) for row in conn.execute(query).fetchall()]
+
+    for pos in positions:
+        if pos.get('source') == 'backfill':
+            continue
+
+        item = pool_map.get(pos.get('stock_code'))
+        buy_price = pos.get('actual_buy_price')
+        current_price = item.get('close') if item else None
+        notes_data = load_position_notes_data(pos)
+        fallback = load_position_notes_data(backfill_map.get(pos.get('stock_code'), {})) if backfill_map.get(pos.get('stock_code')) else {}
+        sell_mode = notes_data.get('sell_mode') or fallback.get('sell_mode', 'REG')
+        signal_labels = notes_data.get('strategy_labels', []) or fallback.get('strategy_labels', []) or []
+        current_labels = item.get('current_labels', []) if item else []
+        registration_date = pos.get('registration_date') or backfill_map.get(pos.get('stock_code'), {}).get('registration_date') or ''
+        days = item.get('trading_days') if item and item.get('trading_days') else '--'
+        if days == '--' and registration_date:
+            try:
+                days = f"T+{(datetime.now() - datetime.strptime(registration_date, '%Y-%m-%d')).days}"
+            except ValueError:
+                days = '--'
+
+        if buy_price and current_price:
+            pnl = f"{((current_price - buy_price) / buy_price) * 100:+.1f}%"
+            exit_str = _actual_sell_alert(current_price, buy_price, sell_mode, registration_date)
+        else:
+            pnl = '--'
+            exit_str = '持仓中' if (sell_mode or '').upper() != 'REG' else '卖出信号(同意注册后卖出)'
+
+        rows.append({
+            'name': (pos.get('stock_name') or pos.get('stock_code') or '')[:12],
+            'code': pos.get('stock_code') or '--',
+            'days': days or '--',
+            'buy_price': f"{buy_price:.2f}" if buy_price else '--',
+            'current_price': f"{current_price:.2f}" if current_price else '--',
+            'pnl': pnl,
+            'exit_str': '已平仓' if pos.get('status') != 'active' else exit_str,
+            'tags': f"首:{_labels_text(signal_labels)} 今:{_labels_text(current_labels)}",
         })
 
     def _day_key(v):
@@ -1024,15 +1290,13 @@ def mode_scan(cache, strategies):
 
     # 监控池
     print(f"\n  监控池 ({len(pool_data)} 只):")
-    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('收盘', 8)} {_pad('上市委通过', 16)} {_pad('T+', 6)} {_pad('首次信号', 16)} {_pad('pre3', 7)} {_pad('pre5', 7)} {_pad('mom10', 8)} {_pad('vol5', 5)} 信号"
+    hdr = f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('收盘', 8)} {_pad('上市委通过', 16)} {_pad('T+', 6)} {_pad('首次信号', 16)} {_pad('首次策略', 18)} {_pad('当天策略', 18)} {_pad('pre3', 7)} {_pad('pre5', 7)} {_pad('mom10', 8)} {_pad('vol5', 5)}"
     print(hdr)
-    print("  " + "-" * 122)
+    print("  " + "-" * (_dw(hdr) - 2))
     for item in pool_data:
         f = item['factors']
-        tags = [s.display_name for s in strategies if item['triggered'].get(s.key)]
-        sig_tag = ' '.join(tags) if tags else ''
-        if not item.get('scan_started', False):
-            sig_tag = sig_tag + '(待)' if sig_tag else ''
+        first_tag = _labels_text(item.get('first_signal_labels', []))
+        current_tag = _labels_text(item.get('current_labels', []))
         tg = item['tongguo_date'] or '--'
         fs = item['first_signal_date'] or '--'
         c = f"{item['close']:.2f}"
@@ -1040,10 +1304,13 @@ def mode_scan(cache, strategies):
         p5 = f"{f['pre5']:+.1f}%"
         m10 = f"{f['mom10']:+.1f}%"
         v5 = f"{f['vol5']:.2f}"
-        row = f"  {_pad(item['name'], 14)} {_pad(item['code'], 8)} {_pad(c, 8)} {_pad(tg, 16)} {_pad(item['trading_days'], 6)} {_pad(fs, 16)} {_pad(p3, 7)} {_pad(p5, 7)} {_pad(m10, 8)} {_pad(v5, 5)} {sig_tag}"
+        row = f"  {_pad(item['name'], 14)} {_pad(item['code'], 8)} {_pad(c, 8)} {_pad(tg, 16)} {_pad(item['trading_days'], 6)} {_pad(fs, 16)} {_pad(first_tag, 18)} {_pad(current_tag, 18)} {_pad(p3, 7)} {_pad(p5, 7)} {_pad(m10, 8)} {_pad(v5, 5)}"
         print(row)
 
     # 模拟持仓
+    actual_rows = build_actual_hold_rows(pool_data, db, active_only=True)
+    print_hold_table("实际持仓", actual_rows)
+
     sim_rows = build_simulated_hold_rows(pool_data, db, active_only=True)
     print_hold_table("模拟持仓", sim_rows)
 
@@ -1057,6 +1324,7 @@ def mode_scan(cache, strategies):
     print(f"  策略说明:")
     for s in strategies:
         print(f"    {s.display_name}: {s.label}  (exit={s.best_exit}, 胜={s.win_rate}, 年化={s.annual})")
+    print(f"    {_strategy_conclusion_text(strategies)}")
     print(f"  卖出: TP +{TP}% / SL {SL}%（持仓期间每日盯市，触发次日卖出）")
     print(f"  买入窗口: 上市委通过 D+{SCAN_START} 起")
 
@@ -1073,6 +1341,9 @@ def mode_hold(cache, strategies):
     sync_stats = sync_simulated_positions(db, pool_data)
     if sync_stats['created'] or sync_stats['closed']:
         print(f"  同步模拟持仓: 新建{sync_stats['created']} 条, 平仓{sync_stats['closed']} 条")
+
+    actual_rows = build_actual_hold_rows(pool_data, db, active_only=True)
+    print_hold_table("实际持仓", actual_rows)
 
     hold_rows = build_simulated_hold_rows(pool_data, db, active_only=False)
     print_hold_table("持仓监控", hold_rows)
@@ -1114,6 +1385,8 @@ def main():
     is_backtest = False
     limit = None
     strategy_key = None
+    buy_cmd = None
+    sell_cmd = None
 
     i = 0
     while i < len(args):
@@ -1132,6 +1405,20 @@ def main():
         elif args[i] == '--strategy' and i + 1 < len(args):
             strategy_key = args[i + 1]
             i += 2
+        elif args[i] == '--buy' and i + 3 < len(args):
+            code = args[i + 1]
+            date = args[i + 2]
+            price = float(args[i + 3])
+            reg_date = args[i + 4] if i + 4 < len(args) and not args[i + 4].startswith('--') else None
+            buy_cmd = (code, date, price, reg_date)
+            i += 4 + (1 if reg_date else 0)
+        elif args[i] == '--sell' and i + 3 < len(args):
+            code = args[i + 1]
+            date = args[i + 2]
+            price = float(args[i + 3])
+            reg_date = args[i + 4] if i + 4 < len(args) and not args[i + 4].startswith('--') else None
+            sell_cmd = (code, date, price, reg_date)
+            i += 4 + (1 if reg_date else 0)
         else:
             i += 1
 
@@ -1146,6 +1433,42 @@ def main():
 
     if is_backtest:
         mode_backtest(cache, strategies, limit)
+    elif buy_cmd:
+        code, date, price, reg_date = buy_cmd
+        name = resolve_stock_name(code, reg_date)
+        triggered_keys, triggered_labels, resolved_reg_date, first_signal_date = resolve_actual_signal_meta(
+            cache, strategies, code, reg_date
+        )
+        db = MonitorDB()
+        db.record_actual_buy(
+            stock_code=code,
+            buy_date=date,
+            buy_price=price,
+            registration_date=resolved_reg_date or reg_date,
+            stock_name=name,
+            first_signal_date=first_signal_date,
+            triggered_strategies=triggered_keys,
+            strategy_labels=triggered_labels,
+            sell_mode='REG',
+        )
+        print(
+            f"已记录买入: {name or code}({code}) 买价={price:.2f} 日期={date}"
+            + (f" 注册日={resolved_reg_date or reg_date}" if (resolved_reg_date or reg_date) else "")
+            + (f" 首信号={first_signal_date}" if first_signal_date else "")
+            + (f" 策略={'/'.join(triggered_labels)}" if triggered_labels else "")
+            + " 卖出=同意注册后卖出"
+        )
+    elif sell_cmd:
+        code, date, price, reg_date = sell_cmd
+        db = MonitorDB()
+        result = db.record_actual_sell(
+            stock_code=code,
+            sell_date=date,
+            sell_price=price,
+            registration_date=reg_date,
+        )
+        ret = result.get('return_pct', 0)
+        print(f"已记录卖出: {code} 卖价={price:.2f} 日期={date} 收益={ret:+.2f}%")
     else:
         cache.ensure_jisilu_data_for_today()
         if mode == 'hold':

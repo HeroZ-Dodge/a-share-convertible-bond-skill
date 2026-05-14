@@ -18,8 +18,7 @@
 """
 
 import math
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 
 
 class StockQualityEvaluator:
@@ -41,7 +40,7 @@ class StockQualityEvaluator:
         Args:
             stock_code: 股票代码
             prices: 可选的股价数据字典 {date: {open, close, high, low, volume}}
-                   如果不提供，会自动从新浪财经获取
+                   如果不提供，会优先从传入的 kline_cache 读取
             
         Returns:
             评估结果字典:

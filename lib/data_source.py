@@ -6,27 +6,23 @@
 
 支持的数据源:
 - 集思录 (待发转债、申购信息) - **公告前即可获取**
-- 东方财富网 (转债发行信息、上市价格、股票K线、主力流向、实时行情、涨停)
+- BaoStock (股票日线、交易日历)
+- 东方财富网 (转债发行信息、上市价格、主力流向、实时行情、涨停，保留作非主路径功能)
 
 Usage:
-    from lib.data_source import JisiluAPI, EastmoneyAPI
+    from lib.data_source import JisiluAPI, BaoStockAPI
 
     # 获取待发转债列表 (公告前)
     jsl = JisiluAPI()
     bonds = jsl.fetch_pending_bonds(limit=10)
 
-    # 获取已上市转债列表
-    em = EastmoneyAPI()
-    bonds = em.fetch_listed_bonds(limit=10)
-
     # 获取股票K线
-    klines = em.fetch_stock_kline('300622', days=90)
+    bs = BaoStockAPI()
+    klines = bs.fetch_stock_kline('300622', days=90)
 """
 
 import json
 import urllib.request
-import urllib.error
-import codecs
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 
@@ -40,10 +36,6 @@ HEADERS = {
     'Accept-Language': 'zh-CN,zh;q=0.9',
     'Referer': 'https://data.eastmoney.com/kzz/',
     'Connection': 'keep-alive',
-}
-
-SINA_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
 }
 
 JISILU_HEADERS = {
@@ -84,84 +76,6 @@ class EastmoneyAPI:
         if stock_code.startswith('6') or stock_code.startswith('900'):
             return '1'
         return '0'
-
-    # ==================== 交易日历 ====================
-
-    def fetch_trading_dates(self, days: int = 10, quiet: bool = False) -> List[str]:
-        """获取最近交易日列表（通过上证指数K线推断）
-
-        Args:
-            days: 请求的K线条数（实际交易日数会略少，因包含非交易日空档）
-
-        Returns:
-            交易日列表，从旧到新排列 ['2026-04-20', '2026-04-21', ...]
-        """
-        url = (
-            f"https://push2his.eastmoney.com/api/qt/stock/kline/get?"
-            f"secid=1.000001&"
-            f"fields1=f1,f2,f3,f4,f5,f6&"
-            f"fields2=f51&"
-            f"klt=101&fqt=1&"
-            f"lmt={days}"
-        )
-        data = self._request(url, log_error=not quiet)
-        if not data or not data.get('data') or not data['data'].get('klines'):
-            return []
-        dates = []
-        for line in data['data']['klines']:
-            parts = line.split(',')
-            if parts:
-                dates.append(parts[0])
-        dates.sort()
-        return dates
-
-    # ==================== K 线数据 ====================
-
-    def fetch_stock_kline(self, stock_code: str, days: int = 90, quiet: bool = False) -> List[Dict[str, Any]]:
-        """
-        获取股票日 K 线数据（东方财富 push2 接口）
-
-        Args:
-            stock_code: 6位股票代码
-            days: 获取天数
-
-        Returns:
-            [{date, open, close, high, low, volume, amount, amplitude,
-              change_pct, change_amount, turnover_rate}, ...]
-        """
-        market = self._get_market_prefix(stock_code)
-        url = (
-            f"https://push2his.eastmoney.com/api/qt/stock/kline/get?"
-            f"secid={market}.{stock_code}&"
-            f"fields1=f1,f2,f3,f4,f5,f6&"
-            f"fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&"
-            f"klt=101&fqt=1&"
-            f"lmt={days}"
-        )
-
-        data = self._request(url, log_error=not quiet)
-        if not data or not data.get('data') or not data['data'].get('klines'):
-            return []
-
-        result = []
-        for line in data['data']['klines']:
-            parts = line.split(',')
-            if len(parts) < 12:
-                continue
-            result.append({
-                'date': parts[0],
-                'open': float(parts[1]),
-                'close': float(parts[2]),
-                'high': float(parts[3]),
-                'low': float(parts[4]),
-                'volume': float(parts[5]),
-                'amount': float(parts[6]),
-                'amplitude': float(parts[7]),
-                'change_pct': float(parts[8]),
-                'change_amount': float(parts[9]),
-                'turnover_rate': float(parts[10]),
-            })
-        return result
 
     # ==================== 主力资金流向 ====================
 
@@ -638,164 +552,119 @@ class EastmoneyAPI:
         return None
 
 
-# ==================== 腾讯行情 API ====================
+# ==================== BaoStock API ====================
 
-class TencentAPI:
-    """腾讯行情数据接口"""
+class BaoStockAPI:
+    """BaoStock 数据接口"""
 
     def __init__(self, timeout: int = 15):
         self.timeout = timeout
 
-    def _get_market_prefix(self, stock_code: str) -> str:
-        """获取市场前缀 (0=深市, 1=沪市)"""
-        if stock_code.startswith('6') or stock_code.startswith('900'):
-            return 'sh'
-        return 'sz'
-
-    def fetch_stock_kline(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
-        """
-        获取腾讯日 K 线数据，包含当日最新交易日。
-
-        腾讯日线接口通常比部分历史 K 线源更容易拿到当天数据。
-        """
-        import json
-
-        market = self._get_market_prefix(stock_code)
-        symbol = f'{market}{stock_code}'
-        url = (
-            f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
-            f"param={symbol},day,,,{days},qfq"
-        )
-
+    def _import_bs(self):
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode('utf-8'))
-        except Exception as e:
-            print(f"获取腾讯日线失败 {stock_code}: {e}")
-            return []
+            import baostock as bs
+            return bs
+        except Exception:
+            raise ImportError(
+                "baostock is required for stock daily data. Install it with `pip install baostock`."
+            )
 
-        if not data or data.get('code') != 0 or not data.get('data'):
-            return []
+    def _market_symbol(self, stock_code: str) -> str:
+        if stock_code.startswith('6') or stock_code.startswith('900'):
+            return f"sh.{stock_code}"
+        return f"sz.{stock_code}"
 
-        stk = data['data'].get(symbol)
-        if not stk:
-            return []
+    def _login(self):
+        bs = self._import_bs()
+        if not bs:
+            return None, None
+        lg = bs.login()
+        if getattr(lg, 'error_code', '1') != '0':
+            try:
+                bs.logout()
+            except Exception:
+                pass
+            return None, None
+        return bs, lg
 
-        buf = stk.get('qfqday') or stk.get('day') or []
+    def _fetch_rows(self, query_fn):
+        bs, _ = self._login()
+        if not bs:
+            return []
+        try:
+            rs = query_fn(bs)
+            if not rs or getattr(rs, 'error_code', '1') != '0':
+                return []
+            rows = []
+            while rs.error_code == '0' and rs.next():
+                rows.append(dict(zip(rs.fields, rs.get_row_data())))
+            return rows
+        except Exception:
+            return []
+        finally:
+            try:
+                bs.logout()
+            except Exception:
+                pass
+
+    def fetch_trade_dates(self, start_date: str = None, end_date: str = None) -> List[str]:
+        """获取交易日历（仅返回交易日）"""
+        if start_date is None:
+            start_date = '2015-01-01'
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+
+        def _query(bs):
+            return bs.query_trade_dates(start_date=start_date, end_date=end_date)
+
+        rows = self._fetch_rows(_query)
         result = []
-        for item in buf:
-            if len(item) < 6:
-                continue
+        for row in rows:
+            if str(row.get('is_trading_day', '0')) == '1':
+                d = row.get('calendar_date') or row.get('date') or ''
+                if d:
+                    result.append(d)
+        return result
+
+    def fetch_stock_kline(self, stock_code: str, days: int = 90, adjustflag: str = '3') -> List[Dict[str, Any]]:
+        """获取股票日线，默认不复权"""
+        code = self._market_symbol(stock_code)
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=max(days * 3, 3650))).strftime('%Y-%m-%d')
+        fields = 'date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST'
+
+        def _query(bs):
+            return bs.query_history_k_data_plus(
+                code,
+                fields,
+                start_date=start_date,
+                end_date=end_date,
+                frequency='d',
+                adjustflag=adjustflag,
+            )
+
+        rows = self._fetch_rows(_query)
+        result = []
+        for row in rows:
             try:
                 result.append({
-                    'date': item[0],
-                    'open': float(item[1]),
-                    'close': float(item[2]),
-                    'high': float(item[3]),
-                    'low': float(item[4]),
-                    'volume': float(item[5]),
-                    'amount': 0,
-                    'amplitude': 0,
-                    'change_pct': 0,
-                    'change_amount': 0,
-                    'turnover_rate': 0,
+                    'date': row.get('date', ''),
+                    'open': float(row.get('open', 0) or 0),
+                    'high': float(row.get('high', 0) or 0),
+                    'low': float(row.get('low', 0) or 0),
+                    'close': float(row.get('close', 0) or 0),
+                    'preclose': float(row.get('preclose', 0) or 0),
+                    'volume': float(row.get('volume', 0) or 0),
+                    'amount': float(row.get('amount', 0) or 0),
+                    'adjustflag': str(row.get('adjustflag', adjustflag) or adjustflag),
+                    'turn': float(row.get('turn', 0) or 0),
+                    'tradestatus': str(row.get('tradestatus', '1') or '1'),
+                    'pctChg': float(row.get('pctChg', 0) or 0),
+                    'isST': str(row.get('isST', '0') or '0'),
                 })
             except (TypeError, ValueError):
                 continue
         return result
-
-
-# ==================== 新浪财经 API ====================
-
-class SinaFinanceAPI:
-    """新浪财经数据接口"""
-    
-    def __init__(self, timeout: int = 20):
-        self.timeout = timeout
-    
-    def _get_market_prefix(self, stock_code: str) -> str:
-        """获取市场前缀"""
-        if stock_code.startswith('6'):
-            return 'sh'  # 沪市
-        else:
-            return 'sz'  # 深市/创业板
-    
-    def fetch_history(self, stock_code: str, days: int = 90) -> Dict[str, Dict[str, float]]:
-        """
-        获取股票历史 K 线数据
-        
-        Args:
-            stock_code: 股票代码 (6 位数字)
-            days: 获取天数
-            
-        Returns:
-            字典：{日期：{open, close, high, low, volume}}
-            例如：{'2026-03-17': {'open': 30.5, 'close': 31.2, ...}}
-        """
-        market = self._get_market_prefix(stock_code)
-        symbol = f'{market}{stock_code}'
-        
-        url = (
-            f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-            f"CN_MarketData.getKLineData?symbol={symbol}&scale=240&ma=no&datalen={days}"
-        )
-        
-        try:
-            req = urllib.request.Request(url, headers=SINA_HEADERS)
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                # 新浪财经返回 GBK 编码
-                reader = codecs.getreader('gbk')
-                data = json.load(reader(response))
-            
-            if not isinstance(data, list):
-                return {}
-            
-            # 解析数据
-            result = {}
-            for day in data:
-                date = day.get('day', '')
-                result[date] = {
-                    'open': float(day.get('open', 0)),
-                    'close': float(day.get('close', 0)),
-                    'high': float(day.get('high', 0)),
-                    'low': float(day.get('low', 0)),
-                    'volume': float(day.get('volume', 0)),
-                }
-            
-            return result
-            
-        except Exception as e:
-            print(f"获取股票 {stock_code} 历史数据失败：{e}")
-            return {}
-    
-    def fetch_current_price(self, stock_code: str) -> Optional[float]:
-        """
-        获取股票当前价格
-        
-        Args:
-            stock_code: 股票代码
-            
-        Returns:
-            当前价格，获取失败返回 None
-        """
-        market = self._get_market_prefix(stock_code)
-        symbol = f'{market}{stock_code}'
-        
-        url = f"https://hq.sinajs.cn/list={symbol}"
-        
-        try:
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=10) as response:
-                content = response.read().decode('gbk')
-                # 格式：var hq_str_sh600000="浦发银行，8.50,..."
-                parts = content.split('"')[1].split(',')
-                if len(parts) >= 4:
-                    return float(parts[3])  # 当前价
-        except Exception as e:
-            print(f"获取股票 {stock_code} 当前价格失败：{e}")
-        
-        return None
 
 
 # ==================== 集思录 API ====================
