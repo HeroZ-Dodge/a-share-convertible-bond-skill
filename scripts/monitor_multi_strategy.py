@@ -34,6 +34,7 @@ import sys, os, re, json
 import unicodedata
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lib.baostock_market_db import BaoStockMarketDB
 from lib.backtest_cache import BacktestCache
 from lib.strategies import registry
 from lib.monitor_db import MonitorDB
@@ -105,7 +106,7 @@ def calc_factors(cache, sc, anchor, as_of_date=None):
 
     盘中若 anchor 恰好是当天最新未收盘交易日，则回退到上一完整交易日。
     """
-    prices = cache.get_kline_as_dict(sc, days=1500)
+    prices = cache.get_kline_as_dict(sc, days=1500, as_of_date=as_of_date)
     if not prices:
         return None
     sd = sorted(prices.keys())
@@ -182,7 +183,7 @@ def calc_factors(cache, sc, anchor, as_of_date=None):
 
 def find_first_signal(cache, stock_code, anchor, today_str):
     """扫描同意注册后到当前为止的首次策略触发日"""
-    prices = cache.get_kline_as_dict(stock_code, days=1500)
+    prices = cache.get_kline_as_dict(stock_code, days=1500, as_of_date=today_str)
     if not prices:
         return '', {}, []
 

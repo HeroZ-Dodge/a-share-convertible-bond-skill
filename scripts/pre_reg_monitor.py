@@ -195,11 +195,15 @@ def parse_progress_full(text):
     return tg_date, reg_date
 
 
-def scan_signals_for_bond(closes, volumes, dates, tg_idx, reg_idx, strategies):
-    """扫描单只债券从上市委通过到注册期间的每日信号"""
+def scan_signals_for_bond(closes, volumes, dates, tg_idx, reg_idx, strategies, as_of_date=None):
+    """扫描单只债券从上市委通过到注册期间的每日信号。
+
+    盘中调用时传入 as_of_date，可自动把当日数据回退到上一完整交易日，
+    避免把未收盘数据当成已收盘因子使用。
+    """
     signals = []
     for idx in range(tg_idx + SCAN_START, reg_idx):
-        factors = calc_factors_at(closes, volumes, idx)
+        factors = calc_factors_at(closes, volumes, idx, dates=dates, as_of_date=as_of_date)
         if not factors:
             continue
         triggered = {s.key: s.matches(factors) for s in strategies}
@@ -322,13 +326,28 @@ def _strategy_conclusion_text(strategies):
     return '结论(当前历史回测): 请以回测排序表为准，优先保留夏普更高、平均亏损更小且年份更稳定的策略。'
 
 
+def _current_factor_as_of_date(now=None):
+    """返回当前因子的 as_of_date。
+
+    15:00 前按盘中处理，当前日期仍视为未收盘，因子回退到上一交易日。
+    15:00 后按盘后处理，当前日期可直接使用已收盘数据。
+    """
+    now = now or datetime.now()
+    if now.hour < 15:
+        return now.strftime('%Y-%m-%d')
+    return None
+
+
 # ========== 回测引擎 ==========
 
-def scan_daily_factors(closes, volumes, dates, ti, ri):
-    """预扫描所有交易日的因子（一次计算，多策略复用）"""
+def scan_daily_factors(closes, volumes, dates, ti, ri, as_of_date=None):
+    """预扫描所有交易日的因子（一次计算，多策略复用）。
+
+    as_of_date 主要用于盘中场景，确保最新交易日不会用到未收盘数据。
+    """
     factor_map = {}
     for idx in range(ti + SCAN_START, ri):
-        f = calc_factors_at(closes, volumes, idx)
+        f = calc_factors_at(closes, volumes, idx, dates=dates, as_of_date=as_of_date)
         if f:
             factor_map[idx] = f
     return factor_map
@@ -940,6 +959,7 @@ def get_pipeline_bonds(cache):
 def build_monitor_pool(cache, strategies):
     """构建监控池，并附带首次信号与模拟持仓状态"""
     today_str = datetime.now().strftime('%Y-%m-%d')
+    factor_as_of_date = _current_factor_as_of_date()
     from datetime import date as date_cls
     parts = today_str.split('-')
     today_date = date_cls(int(parts[0]), int(parts[1]), int(parts[2]))
@@ -980,7 +1000,7 @@ def build_monitor_pool(cache, strategies):
         if dates[today_idx] == today_str and today_idx > 0:
             current_idx = today_idx - 1
 
-        factors = calc_factors_at(closes, volumes, current_idx, dates=dates, as_of_date=today_str)
+        factors = calc_factors_at(closes, volumes, current_idx, dates=dates, as_of_date=factor_as_of_date)
         if not factors:
             continue
         current = klines[dates[current_idx]]
@@ -996,7 +1016,7 @@ def build_monitor_pool(cache, strategies):
             scan_started = (today_idx >= ti + SCAN_START)
             if ti >= 0:
                 first_signal_idx, first_signal_factors, first_signal_triggered = find_first_signal(
-                    closes, volumes, dates, ti, today_idx + 1, strategies, as_of_date=today_str
+                    closes, volumes, dates, ti, today_idx + 1, strategies, as_of_date=factor_as_of_date
                 )
                 if first_signal_idx is not None:
                     buy_idx = first_signal_idx + 1

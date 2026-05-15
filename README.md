@@ -11,21 +11,18 @@ a-share-convertible-bond-skill/
 ├── monitor_history.json             # 监控历史记录
 │
 ├── data/                            # 本地数据
-│   ├── bonds.db
-│   ├── pending_bonds_history.json
-│   ├── signals_history.json
-│   └── evolution_stats.json
+│   ├── baostock_market.db
+│   ├── backtest_cache.db
+│   └── pending_bonds.db
 │
 ├── lib/                             # 核心模块
 │   ├── __init__.py
-│   ├── data_source.py               # 数据源接口（集思录/东方财富/新浪财经）
-│   ├── bond_calculator.py           # 配债计算
-│   ├── report.py                    # 报告生成
-│   ├── stock_quality.py             # 股票质量评估
-│   ├── signal_tracker.py            # 信号跟踪
-│   ├── self_evolution.py            # 自我进化
-│   ├── sqlite_database.py           # SQLite数据库
-│   └── local_database.py            # 本地数据存储
+│   ├── data_source.py               # 数据源接口（集思录/东方财富/BaoStock）
+│   ├── baostock_market_db.py        # BaoStock 日线数据库
+│   ├── backtest_cache.py            # 回测/监控缓存
+│   ├── monitor_db.py                # 监控数据库
+│   ├── strategies.py                # 策略定义
+│   └── fetch_bonds.py               # 待发转债抓取与入库
 │
 ├── scripts/                         # 脚本
 │   ├── analyze_pending.py           # 待发转债列表
@@ -33,19 +30,12 @@ a-share-convertible-bond-skill/
 │   ├── analyze_registration_impact.py
 │   ├── analyze_registration_to_announcement.py
 │   ├── analyze_early_signals.py
-│   ├── monitor_history.json
-│   │
-│   └── monitor/                     # 监控脚本
-│       ├── monitor_latent_strategy.py   # 潜伏策略监控
-│       ├── backtest_latent_strategy.py  # 潜伏策略回测
-│       ├── README.md                    # 使用说明
-│       └── 潜伏策略监控使用说明.md
+│   ├── pre_reg_monitor.py          # 注册前信号监控
+│   └── monitor_multi_strategy.py   # 多策略监控
 │
 ├── docs/                            # 分析报告
 ├── reference/                       # 参考资料
 │   └── api-docs.md
-│
-└── test_stock_quality.py            # 股票质量评估测试
 ```
 
 ## 快速开始
@@ -57,14 +47,11 @@ a-share-convertible-bond-skill/
 **核心逻辑**：统计显示同意注册前 5 天平均涨幅 +4.56%，上涨概率 81.8%，说明有资金可能提前获知消息布局。
 
 ```bash
-# 运行一次
-python3 scripts/monitor/monitor_latent_strategy.py --once
+# 注册前信号监控
+python3 scripts/pre_reg_monitor.py
 
-# 持续监控（每 60 分钟）
-python3 scripts/monitor/monitor_latent_strategy.py
-
-# 查看进化报告
-python3 scripts/monitor/monitor_latent_strategy.py --report
+# 多策略监控
+python3 scripts/monitor_multi_strategy.py --once
 ```
 
 触发信号的条件：
@@ -73,7 +60,7 @@ python3 scripts/monitor/monitor_latent_strategy.py --report
 - 股价突破 20 日高点
 - 股票质量 B 级及以上
 
-详见：[scripts/monitor/README.md](scripts/monitor/README.md)
+详见：`scripts/pre_reg_monitor.py` 与 `scripts/monitor_multi_strategy.py`
 
 ### 2. 查看待发转债
 
@@ -118,29 +105,21 @@ ds = BondDataSource()
 bonds, source = ds.fetch_bonds(limit=10, pending_only=True)
 ```
 
-### lib/bond_calculator.py - 配债计算
+### lib/baostock_market_db.py - BaoStock 行情数据库
 
 ```python
-from lib.bond_calculator import BondCalculator
+from lib.baostock_market_db import BaoStockMarketDB
 
-calc = BondCalculator(target_bonds=10, bond_price=100)
-
-# 配债额度 = 持股数 × 每股配售额
-result = calc.calculate_allocation(
-    stock_code='300622',
-    shares=1500,
-    per_share_amount=1.6457
-)
+db = BaoStockMarketDB()
+prices = db.get_kline_as_dict('300622', days=90)
 ```
 
-### lib/stock_quality.py - 股票质量评估
+### lib/fetch_bonds.py - 待发转债抓取
 
 ```python
-from lib.stock_quality import StockQualityEvaluator
+from lib.fetch_bonds import fetch_and_save
 
-evaluator = StockQualityEvaluator()
-quality = evaluator.evaluate('300622', prices)
-# 返回 A/B/C/D 等级，基于趋势/动量/成交量/波动性
+bonds, stats = fetch_and_save(limit=10)
 ```
 
 ## 配债计算公式
@@ -163,12 +142,12 @@ quality = evaluator.evaluate('300622', prices)
 | 数据源 | 用途 | 特点 |
 |--------|------|------|
 | 集思录 | 待发转债 + 审批进度 | 公告发布前即可获取，推荐优先使用 |
-| 东方财富 | 已上市转债列表 | 数据完整、更新及时 |
-| 新浪财经 | 股票历史价格 | 支持 90 天历史 K 线 |
+| BaoStock | 股票历史价格 | 作为当前分支的唯一行情来源 |
+| 东方财富 | 转债/市场辅助数据 | 保留作非主路径功能 |
 
 ## 注意事项
 
-1. **API 限流**: 在线模式会调用东方财富和新浪财经 API，建议批量获取
+1. **API 限流**: 在线模式会调用集思录、东方财富和 BaoStock，建议批量获取
 2. **交易日计算**: T-3/T-2/T-1/T+1 自动跳过周末和节假日
 3. **数据 fallback**: 上市价格获取失败时，使用 FIRST_PROFIT 反推
 4. **潜伏策略**: 前 10 个案例进化效果不明显，需要耐心积累数据

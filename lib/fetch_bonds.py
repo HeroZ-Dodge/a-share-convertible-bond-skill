@@ -22,8 +22,10 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
+import sqlite3
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -35,7 +37,156 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from lib.data_source import JisiluAPI
-from lib.sqlite_database import SQLiteDatabase
+
+
+class PendingBondsStore:
+    """待发转债轻量存储。"""
+
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path is None:
+            db_path = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                'data',
+                'pending_bonds.db',
+            )
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self._init_db()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        with self._get_conn() as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS pending_bonds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bond_code TEXT NOT NULL,
+                    bond_name TEXT,
+                    stock_code TEXT,
+                    stock_name TEXT,
+                    progress TEXT,
+                    progress_full TEXT,
+                    apply_date TEXT,
+                    record_date TEXT,
+                    apply_code TEXT,
+                    ration_code TEXT,
+                    ration REAL,
+                    amount REAL,
+                    convert_price REAL,
+                    rating TEXT,
+                    status TEXT,
+                    market TEXT,
+                    record_price REAL,
+                    first_profit REAL,
+                    source TEXT,
+                    fetched_at TEXT,
+                    UNIQUE(bond_code, fetched_at)
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_date TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    source TEXT,
+                    total_count INTEGER,
+                    changed_count INTEGER,
+                    UNIQUE(snapshot_date)
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_bond_code ON pending_bonds(bond_code)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_fetched_at ON pending_bonds(fetched_at)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_snapshot_date ON snapshots(snapshot_date)')
+            conn.commit()
+
+    def save_pending_bonds(self, bonds: List[Dict], source: str = 'jisilu') -> Dict[str, int]:
+        if not bonds:
+            return {'total': 0, 'new': 0, 'changed': 0, 'unchanged': 0}
+
+        fetched_at = datetime.now().isoformat(timespec='seconds')
+        snapshot_date = datetime.now().strftime('%Y-%m-%d')
+        current_map = {
+            b.get('bond_code'): json.dumps(b, ensure_ascii=False, sort_keys=True)
+            for b in bonds
+            if b.get('bond_code')
+        }
+
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                '''
+                SELECT bond_code, bond_name, stock_code, stock_name, progress, progress_full,
+                       apply_date, record_date, apply_code, ration_code, ration, amount,
+                       convert_price, rating, status, market, record_price, first_profit
+                FROM pending_bonds
+                WHERE fetched_at = (
+                    SELECT fetched_at FROM pending_bonds
+                    ORDER BY fetched_at DESC
+                    LIMIT 1
+                )
+                '''
+            ).fetchall()
+            prev_map = {}
+            for row in rows:
+                prev_map[row['bond_code']] = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
+
+            stats = {'total': len(bonds), 'new': 0, 'changed': 0, 'unchanged': 0}
+            for b in bonds:
+                code = b.get('bond_code')
+                if not code:
+                    continue
+                if code not in prev_map:
+                    stats['new'] += 1
+                elif prev_map[code] != current_map[code]:
+                    stats['changed'] += 1
+                else:
+                    stats['unchanged'] += 1
+
+                conn.execute(
+                    '''
+                    INSERT OR REPLACE INTO pending_bonds (
+                        bond_code, bond_name, stock_code, stock_name, progress, progress_full,
+                        apply_date, record_date, apply_code, ration_code, ration, amount,
+                        convert_price, rating, status, market, record_price, first_profit,
+                        source, fetched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        b.get('bond_code', ''),
+                        b.get('bond_name', ''),
+                        b.get('stock_code', ''),
+                        b.get('stock_name', ''),
+                        b.get('progress', ''),
+                        b.get('progress_full', ''),
+                        b.get('apply_date', ''),
+                        b.get('record_date', ''),
+                        b.get('apply_code', ''),
+                        b.get('ration_code', ''),
+                        b.get('ration', 0),
+                        b.get('amount', 0),
+                        b.get('convert_price', 0),
+                        b.get('rating', ''),
+                        b.get('status', ''),
+                        b.get('market', ''),
+                        b.get('record_price', 0),
+                        b.get('first_profit', 0),
+                        source,
+                        fetched_at,
+                    ),
+                )
+
+            conn.execute(
+                '''
+                INSERT OR REPLACE INTO snapshots (
+                    snapshot_date, timestamp, source, total_count, changed_count
+                ) VALUES (?, ?, ?, ?, ?)
+                ''',
+                (snapshot_date, fetched_at, source, len(bonds), stats['changed']),
+            )
+            conn.commit()
+            return stats
 
 
 def fetch_pending_bonds(
@@ -100,7 +251,7 @@ def fetch_and_save(
     stats = {'total': len(bonds), 'new': 0, 'changed': 0, 'unchanged': 0}
     
     if save:
-        db = SQLiteDatabase(db_path)
+        db = PendingBondsStore(db_path)
         stats = db.save_pending_bonds(bonds, source='jisilu')
         print(f"💾 已保存到数据库 | 新增: {stats['new']}, 变化: {stats['changed']}, 未变: {stats['unchanged']}")
     

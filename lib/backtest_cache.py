@@ -24,6 +24,11 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 
+try:
+    from .baostock_market_db import BaoStockMarketDB
+except ImportError:  # 直接运行脚本时回退为绝对导入
+    from lib.baostock_market_db import BaoStockMarketDB
+
 # 交易日历缓存：30分钟内复用同一结果，避免频繁调API
 _latest_trade_date_cache: Dict[str, Any] = {'time': 0, 'date': ''}
 
@@ -41,6 +46,7 @@ class BacktestCache:
                 'data', 'backtest_cache.db'
             )
         self.db_path = db_path
+        self.market_db = BaoStockMarketDB()
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._init_db()
 
@@ -752,109 +758,20 @@ class BacktestCache:
     # ============================================================
 
     def fetch_and_save_kline(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
-        """
-        从 BaoStock 获取日线并缓存。
-
-        只保留一条主链路，不做其它股票数据源兜底。
-        """
-        from lib.data_source import BaoStockAPI
-
-        api = BaoStockAPI(timeout=15)
-        rows = api.fetch_stock_kline(stock_code, days=days)
-        if not rows:
-            return []
-        trade_dates = api.fetch_trade_dates()
-
-        with self._get_conn() as conn:
-            for k in rows:
-                conn.execute('''
-                    INSERT OR REPLACE INTO stock_daily_bars
-                    (stock_code, trade_date, source, adjustflag, open, close, high, low,
-                     preclose, volume, amount, turn, tradestatus, pctChg, isST, fetched_at)
-                    VALUES (?, ?, 'baostock', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (
-                    stock_code,
-                    k['date'],
-                    k.get('adjustflag', '3'),
-                    k.get('open', 0),
-                    k.get('close', 0),
-                    k.get('high', 0),
-                    k.get('low', 0),
-                    k.get('preclose', 0),
-                    k.get('volume', 0),
-                    k.get('amount', 0),
-                    k.get('turn', 0),
-                    k.get('tradestatus', '1'),
-                    k.get('pctChg', 0),
-                    k.get('isST', '0'),
-                ))
-
-            calendar_dates = sorted(set(trade_dates or []) | {k['date'] for k in rows if k.get('date')})
-            for d in calendar_dates:
-                conn.execute('''
-                    INSERT OR REPLACE INTO stock_trade_calendar
-                    (trade_date, is_trading_day, source, fetched_at)
-                    VALUES (?, 1, 'baostock', CURRENT_TIMESTAMP)
-                ''', (d,))
-            conn.commit()
-
-        if calendar_dates:
-            global _latest_trade_date_cache
-            _latest_trade_date_cache = {
-                'time': time.time(),
-                'date': calendar_dates[-1],
-            }
-
-        return rows
+        """向新的 baostock 专用库补写日线数据。"""
+        return self.market_db.ensure_kline(stock_code, days=days, refresh=True)
 
     def _get_latest_trading_date(self) -> str:
-        """获取最新交易日（BaoStock 交易日历）
+        """获取最新交易日。"""
+        return self.market_db.get_latest_trading_date()
 
-        同一会话内30分钟复用，避免频繁调API。
-        """
-        global _latest_trade_date_cache
-        now = time.time()
-        if _latest_trade_date_cache['time'] and now - _latest_trade_date_cache['time'] < 1800:
-            return _latest_trade_date_cache['date']
-
-        with self._get_conn() as conn:
-            row = conn.execute('''
-                SELECT trade_date
-                FROM stock_trade_calendar
-                WHERE is_trading_day = 1
-                ORDER BY trade_date DESC
-                LIMIT 1
-            ''').fetchone()
-        if row and row['trade_date']:
-            result = row['trade_date']
-            _latest_trade_date_cache = {'time': now, 'date': result}
-            return result
-
-        # 本地没有日历时，直接从 BaoStock 拉交易日并写入缓存
-        try:
-            from lib.data_source import BaoStockAPI
-            api = BaoStockAPI(timeout=15)
-            trading_dates = api.fetch_trade_dates()
-            if trading_dates:
-                result = trading_dates[-1]
-                with self._get_conn() as conn:
-                    for d in trading_dates:
-                        conn.execute('''
-                            INSERT OR REPLACE INTO stock_trade_calendar
-                            (trade_date, is_trading_day, source, fetched_at)
-                            VALUES (?, 1, 'baostock', CURRENT_TIMESTAMP)
-                        ''', (d,))
-                    conn.commit()
-                _latest_trade_date_cache = {'time': now, 'date': result}
-                return result
-        except Exception:
-            pass
-
-        result = ''
-        _latest_trade_date_cache = {'time': now, 'date': result}
-        return result
-
-    def get_kline_as_dict(self, stock_code: str, days: int = 90, skip_freshness_check: bool = False) -> Dict[str, Dict[str, float]]:
+    def get_kline_as_dict(
+        self,
+        stock_code: str,
+        days: int = 90,
+        skip_freshness_check: bool = False,
+        as_of_date: Optional[str] = None,
+    ) -> Dict[str, Dict[str, float]]:
         """
         获取 K 线数据并转换为 {date: {open, close, ...}} 格式，兼容现有脚本
 
@@ -870,61 +787,12 @@ class BacktestCache:
         Returns:
             {date: {open, close, high, low, volume, amount, amplitude, change_pct, change_amount, turnover_rate}}
         """
-        with self._get_conn() as conn:
-            cursor = conn.execute('''
-                SELECT * FROM stock_daily_bars
-                WHERE stock_code = ?
-                ORDER BY trade_date DESC
-                LIMIT ?
-            ''', (stock_code, days))
-            rows = cursor.fetchall()
-
-        global _kline_refresh_cache
-        now_ts = time.time()
-
-        if not rows or len(rows) < min(days, 150):
-            # 缓存数据不足，从 API 补充（30分钟内不重复刷新同一只）
-            last_refresh = _kline_refresh_cache.get(stock_code, 0)
-            if now_ts - last_refresh > 1800:
-                self.fetch_and_save_kline(stock_code, days=days)
-                _kline_refresh_cache[stock_code] = now_ts
-            rows = self.get_kline_data(stock_code, days=days)
-
-        # 缓存过期检查：基于真实交易日历推断，不用启发式阈值
-        if not skip_freshness_check and rows:
-            last_cached = rows[0]['trade_date']
-            latest = self._get_latest_trading_date()
-            if latest and last_cached < latest:
-                last_refresh = _kline_refresh_cache.get(stock_code, 0)
-                if now_ts - last_refresh > 1800:
-                    self.fetch_and_save_kline(stock_code, days=days)
-                    _kline_refresh_cache[stock_code] = now_ts
-                rows = self.get_kline_data(stock_code, days=days)
-
-        result = {}
-        for row in reversed(rows):
-            d = dict(row)
-            pct_chg = d.get('pctChg', 0) or 0
-            turn = d.get('turn', 0) or 0
-            result[d['trade_date']] = {
-                'open': d['open'],
-                'close': d['close'],
-                'high': d['high'],
-                'low': d['low'],
-                'volume': d['volume'],
-                'amount': d['amount'],
-                'amplitude': 0,
-                'change_pct': pct_chg,
-                'change_amount': ((d['close'] - d['preclose']) if d.get('preclose') else 0),
-                'turnover_rate': turn,
-                'preclose': d.get('preclose', 0),
-                'adjustflag': d.get('adjustflag', '3'),
-                'tradestatus': d.get('tradestatus', '1'),
-                'pctChg': pct_chg,
-                'turn': turn,
-                'isST': d.get('isST', '0'),
-            }
-        return result
+        return self.market_db.get_kline_as_dict(
+            stock_code,
+            days=days,
+            as_of_date=as_of_date,
+            refresh=not skip_freshness_check,
+        )
 
     def ensure_kline(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
         """
@@ -933,28 +801,11 @@ class BacktestCache:
         Returns:
             K 线数据列表
         """
-        with self._get_conn() as conn:
-            cursor = conn.execute(
-                'SELECT COUNT(*) as cnt FROM stock_daily_bars WHERE stock_code = ?',
-                (stock_code,)
-            )
-            count = cursor.fetchone()['cnt']
-
-        if count < min(days, 60):
-            return self.fetch_and_save_kline(stock_code, days=days)
-
-        return self.get_kline_data(stock_code, days=days)
+        return self.market_db.ensure_kline(stock_code, days=days, refresh=True)
 
     def get_kline_data(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
-        """获取 K 线数据列表"""
-        with self._get_conn() as conn:
-            cursor = conn.execute('''
-                SELECT * FROM stock_daily_bars
-                WHERE stock_code = ?
-                ORDER BY trade_date DESC
-                LIMIT ?
-            ''', (stock_code, days))
-            return [dict(row) for row in cursor.fetchall()]
+        """获取 K 线数据列表。"""
+        return self.market_db.get_kline_data(stock_code, days=days)
 
     # ============================================================
     # 主力资金流向
@@ -1403,15 +1254,11 @@ class BacktestCache:
         Returns:
             {klines: dict, latest_trade_date: str}
         """
-        return {
-            'klines': self.get_kline_as_dict(stock_code, days=days),
-            'latest_trade_date': self._get_latest_trading_date(),
-        }
+        return self.market_db.get_stock_data(stock_code, days=days)
 
     def ensure_all_stock_data(self, stock_code: str, days: int = 90):
         """确保股票日线与交易日历已缓存"""
-        self.ensure_kline(stock_code, days=days)
-        self._get_latest_trading_date()
+        self.market_db.ensure_all_stock_data(stock_code, days=days)
 
     def get_stats(self) -> Dict[str, int]:
         """获取数据库统计信息"""
@@ -1423,15 +1270,11 @@ class BacktestCache:
             stats['jisilu_records'] = conn.execute(
                 'SELECT COUNT(*) FROM jisilu_pending_bonds'
             ).fetchone()[0]
-            stats['kline_records'] = conn.execute(
-                'SELECT COUNT(*) FROM stock_daily_bars'
-            ).fetchone()[0]
-            stats['kline_stocks'] = conn.execute(
-                'SELECT COUNT(DISTINCT stock_code) FROM stock_daily_bars'
-            ).fetchone()[0]
-            stats['trade_calendar_records'] = conn.execute(
-                'SELECT COUNT(*) FROM stock_trade_calendar'
-            ).fetchone()[0]
+            market_stats = self.market_db.get_stats()
+            stats['kline_records'] = market_stats['stock_daily_records']
+            stats['kline_stocks'] = market_stats['stock_daily_symbols']
+            stats['trade_calendar_records'] = market_stats['trade_calendar_records']
+            stats['sync_state_records'] = market_stats['sync_state_records']
             stats['fund_flow_records'] = conn.execute(
                 'SELECT COUNT(*) FROM eastmoney_fund_flow'
             ).fetchone()[0]
@@ -1472,7 +1315,8 @@ if __name__ == '__main__':
         print(f'  主力流向: {stats["fund_flow_records"]} 条记录')
         print(f'  行情快照: {stats["quote_records"]} 条记录')
         print(f'  涨停数据: {stats["limit_up_records"]} 条记录')
-        print(f'  数据库大小: {os.path.getsize(c.db_path) / 1024:.1f} KB')
+        print(f'  集思录库大小: {os.path.getsize(c.db_path) / 1024:.1f} KB')
+        print(f'  BaoStock 库大小: {os.path.getsize(c.market_db.db_path) / 1024:.1f} KB')
         sys.exit(0)
 
     if '--snapshot' in sys.argv:
@@ -1522,3 +1366,4 @@ if __name__ == '__main__':
     print(f'  主力流向: {db_stats["fund_flow_records"]} 条')
     print(f'  行情快照: {db_stats["quote_records"]} 条')
     print(f'  涨停数据: {db_stats["limit_up_records"]} 条')
+    print(f'  BaoStock 库: {c.market_db.db_path}')
