@@ -23,16 +23,18 @@ from __future__ import annotations
 class Strategy:
     """策略定义"""
 
-    __slots__ = ('key', 'label', 'display_name', 'condition', 'best_exit', 'sharpe')
+    __slots__ = ('key', 'label', 'display_name', 'condition', 'best_exit', 'sharpe', 'scope')
 
     def __init__(self, key: str, label: str, condition,
-                 best_exit: str = '', sharpe: str = '', display_name: str = ''):
+                 best_exit: str = '', sharpe: str = '', display_name: str = '',
+                 scope: str = 'reg'):
         self.key = key
         self.label = label
         self.display_name = display_name
         self.condition = condition
         self.best_exit = best_exit
         self.sharpe = sharpe
+        self.scope = scope
 
     def __repr__(self):
         return f"Strategy({self.key}, {self.label})"
@@ -137,6 +139,15 @@ _VERIFIED = [
              condition=lambda f: f['pre3'] <= -1.5 and f['consec_down'] <= 1,
              best_exit='TP5/SL5', sharpe='+0.40'),
 
+    # 注册后第 5-12 天，量能未放大、短线未破位，常见于二次确认后的延续反弹
+    Strategy('post_reg_rebound', 'age5-12+pre3<=0+mom10>=-2+vol<=1.0',
+             display_name='注册后反弹',
+             condition=lambda f: 5 <= f.get('calendar_diff', f.get('days_since', 0)) <= 12
+                               and f['pre3'] <= 0
+                               and f['mom10'] >= -2
+                               and f['vol_ratio5'] <= 1.0,
+             best_exit='TP5/SL5', sharpe='+1.88', scope='hold'),
+
 ]
 
 # 注册前信号策略（需 mom20 因子，独立于预注册监控脚本中运行）
@@ -162,5 +173,5 @@ def _register_defaults():
 registry = StrategyRegistry()
 _register_defaults()
 
-# 已淘汰策略（夏普过低，无预测力）
-registry.disable(['broad_momentum'])
+# 已淘汰/实验策略（夏普过低或当前样本不够强，默认不启用）
+registry.disable(['broad_momentum', 'post_reg_rebound'])

@@ -19,7 +19,7 @@
 用法:
   --scan                    扫描今日注册前信号（需集思录实时数据）
   --hold                    查看模拟持仓与持仓监控
-  --backtest                历史回测（所有已注册转债）
+  --backtest                历史回测（仅 2024-01-01 及之后的已注册转债）
   --backtest --limit 100    指定样本数
   --backtest --strategy mom_recover  指定策略
   --buy CODE DATE PRICE [REG_DATE]   记录实际买入
@@ -37,6 +37,7 @@ from lib.monitor_db import MonitorDB
 SCAN_START = 20  # 距上市委通过第 20 个交易日起检测
 TP = 5.0         # 止盈阈值%
 SL = -5.0        # 止损阈值%
+BACKTEST_START_DATE = '2024-01-01'
 
 
 class PreRegStrategy:
@@ -60,6 +61,18 @@ class PreRegStrategy:
 
 
 PRE_REG_STRATEGIES = [
+    PreRegStrategy(
+        key='late_reversal', label='calendar_diff 28-42+pre5<=-12+rc>=3',
+        display_name='后段反转',
+        condition=lambda f: 28 <= f.get('calendar_diff', 0) <= 42 and f['pre5'] <= -12 and f['rc'] >= 3,
+        best_exit='REG', win_rate='75%', annual='+134%',
+    ),
+    PreRegStrategy(
+        key='late_momentum', label='calendar_diff 32-45+pre3<=-6+mom10>=3+vol5<=0.9',
+        display_name='后段动量',
+        condition=lambda f: 32 <= f.get('calendar_diff', 0) <= 45 and f['pre3'] <= -6 and f['mom10'] >= 3 and f['vol5'] <= 0.9,
+        best_exit='REG', win_rate='69%', annual='+134%',
+    ),
     PreRegStrategy(
         key='mom_recover', label='pre3<=-1.5+mom10>=0.5+vol5<=0.9',
         display_name='动量恢复',
@@ -110,6 +123,16 @@ def find_idx(dates, target):
     return result
 
 
+def _calendar_diff(left: str, right: str) -> int:
+    """返回两个 YYYY-MM-DD 日期字符串之间的自然日差。"""
+    try:
+        ldt = datetime.strptime(left, '%Y-%m-%d').date()
+        rdt = datetime.strptime(right, '%Y-%m-%d').date()
+        return (ldt - rdt).days
+    except Exception:
+        return 0
+
+
 def calc_factors_at(closes, volumes, idx, dates=None, as_of_date=None):
     """计算 idx 日收盘后的策略因子。
 
@@ -133,6 +156,7 @@ def calc_factors_at(closes, volumes, idx, dates=None, as_of_date=None):
     pre5 = ((t1 - t5) / t5 * 100) if t5 > 0 else 0
     mom10 = ((t1 - t10) / t10 * 100) if t10 > 0 else 0
     mom20 = ((t1 - t20) / t20 * 100) if t20 > 0 else 0
+    rc = ((closes[factor_idx] - closes[factor_idx - 1]) / closes[factor_idx - 1] * 100) if factor_idx > 0 and closes[factor_idx - 1] > 0 else 0
 
     vol_t = volumes[factor_idx]
     avg5 = sum(volumes[factor_idx - 5:factor_idx]) / 5
@@ -151,7 +175,7 @@ def calc_factors_at(closes, volumes, idx, dates=None, as_of_date=None):
     ma20p = (closes[factor_idx] / ma20 - 1) * 100
 
     return {
-        'pre3': pre3, 'pre5': pre5, 'mom10': mom10, 'mom20': mom20,
+        'pre3': pre3, 'pre5': pre5, 'mom10': mom10, 'mom20': mom20, 'rc': rc,
         'vol5': vol5, 'vol10': vol10,
         'cdown': cdown, 'cup': cup,
         'ma5p': ma5p, 'ma10p': ma10p, 'ma20p': ma20p,
@@ -195,17 +219,19 @@ def parse_progress_full(text):
     return tg_date, reg_date
 
 
-def scan_signals_for_bond(closes, volumes, dates, tg_idx, reg_idx, strategies, as_of_date=None):
+def scan_signals_for_bond(closes, volumes, dates, tg_idx, reg_idx, strategies, as_of_date=None, tg_date=None):
     """扫描单只债券从上市委通过到注册期间的每日信号。
 
     盘中调用时传入 as_of_date，可自动把当日数据回退到上一完整交易日，
     避免把未收盘数据当成已收盘因子使用。
     """
     signals = []
+    through_date = tg_date or dates[tg_idx]
     for idx in range(tg_idx + SCAN_START, reg_idx):
         factors = calc_factors_at(closes, volumes, idx, dates=dates, as_of_date=as_of_date)
         if not factors:
             continue
+        factors['calendar_diff'] = _calendar_diff(dates[idx], through_date)
         triggered = {s.key: s.matches(factors) for s in strategies}
         if any(triggered.values()):
             signals.append({'date': dates[idx], 'idx': idx, 'factors': factors, 'triggered': triggered})
@@ -321,6 +347,8 @@ def _labels_text(labels, default='—'):
 def _strategy_conclusion_text(strategies):
     """根据当前回测结论生成策略排序摘要"""
     names = [s.display_name for s in strategies]
+    if {'后段反转', '后段动量'}.issubset(set(names)):
+        return '结论(当前历史回测): 后段反转 > 后段动量；优先保留后段反转，后段动量作为备选。'
     if {'动量恢复', '高胜率', 'MA5过滤'}.issubset(set(names)):
         return '结论(当前历史回测): MA5过滤 > 高胜率 > 动量恢复；优先保留 MA5过滤，高胜率次选，动量恢复观察。'
     return '结论(当前历史回测): 请以回测排序表为准，优先保留夏普更高、平均亏损更小且年份更稳定的策略。'
@@ -340,28 +368,32 @@ def _current_factor_as_of_date(now=None):
 
 # ========== 回测引擎 ==========
 
-def scan_daily_factors(closes, volumes, dates, ti, ri, as_of_date=None):
+def scan_daily_factors(closes, volumes, dates, ti, ri, as_of_date=None, through_date=None):
     """预扫描所有交易日的因子（一次计算，多策略复用）。
 
     as_of_date 主要用于盘中场景，确保最新交易日不会用到未收盘数据。
     """
     factor_map = {}
+    source_tg = through_date or dates[ti]
     for idx in range(ti + SCAN_START, ri):
         f = calc_factors_at(closes, volumes, idx, dates=dates, as_of_date=as_of_date)
         if f:
+            f['calendar_diff'] = _calendar_diff(dates[idx], source_tg)
             factor_map[idx] = f
     return factor_map
 
 
-def find_first_signal(closes, volumes, dates, ti, ri, strategies, as_of_date=None):
+def find_first_signal(closes, volumes, dates, ti, ri, strategies, as_of_date=None, through_date=None):
     """找出首次触发策略的交易日"""
     first_idx = None
     first_factors = None
     first_triggered = None
+    source_tg = through_date or dates[ti]
     for idx in range(ti + SCAN_START, ri):
         f = calc_factors_at(closes, volumes, idx, dates=dates, as_of_date=as_of_date)
         if not f:
             continue
+        f['calendar_diff'] = _calendar_diff(dates[idx], source_tg)
         triggered = {s.key: s.matches(f) for s in strategies}
         if any(triggered.values()):
             first_idx = idx
@@ -531,6 +563,8 @@ def build_backtest_pool(cache, strategies, check_interval=2):
 
         tongguo_date, reg_date = parse_progress_full(pf)
         if not reg_date or reg_date > today_str: continue
+        if reg_date < BACKTEST_START_DATE:
+            continue
         if tongguo_date and tongguo_date >= reg_date:
             tongguo_date = ''
 
@@ -548,7 +582,7 @@ def build_backtest_pool(cache, strategies, check_interval=2):
         if ti < 22: ti = 22
         if ri is None or ri <= ti: continue
 
-        factor_map = scan_daily_factors(closes, volumes, dates, ti, ri)
+        factor_map = scan_daily_factors(closes, volumes, dates, ti, ri, through_date=tongguo_date)
 
         for s in strategies:
             # 找该策略首次触发日
@@ -602,6 +636,7 @@ def build_backtest_pool(cache, strategies, check_interval=2):
                 'code': sc,
                 'name': (b.get('bond_name') or b.get('stock_name') or b.get('stock_nm') or '?')[:12],
                 'anchor': reg_date,
+                'tongguo_date': tongguo_date,
                 'strategy_key': s.key,
                 'signal_date': signal_date,
                 'offset_reg': first_idx - ri,
@@ -1003,6 +1038,8 @@ def build_monitor_pool(cache, strategies):
         factors = calc_factors_at(closes, volumes, current_idx, dates=dates, as_of_date=factor_as_of_date)
         if not factors:
             continue
+        if tongguo_date:
+            factors['calendar_diff'] = _calendar_diff(dates[current_idx], tongguo_date)
         current = klines[dates[current_idx]]
 
         # 首次信号
@@ -1016,7 +1053,7 @@ def build_monitor_pool(cache, strategies):
             scan_started = (today_idx >= ti + SCAN_START)
             if ti >= 0:
                 first_signal_idx, first_signal_factors, first_signal_triggered = find_first_signal(
-                    closes, volumes, dates, ti, today_idx + 1, strategies, as_of_date=factor_as_of_date
+                    closes, volumes, dates, ti, today_idx + 1, strategies, as_of_date=factor_as_of_date, through_date=tongguo_date
                 )
                 if first_signal_idx is not None:
                     buy_idx = first_signal_idx + 1
@@ -1062,6 +1099,7 @@ def build_monitor_pool(cache, strategies):
             'dates': dates,
             'factors': factors,
             'tongguo_date': tongguo_date,
+            'calendar_diff': factors.get('calendar_diff', 0),
             'days_natural': days_natural,
             'trading_days': trading_days,
             'first_signal_date': first_signal_date,
@@ -1340,6 +1378,8 @@ def mode_scan(cache, strategies):
     print(f"    pre5  = 距今日5个交易日的跌幅 (T-5 至 T-1 收盘价涨幅)")
     print(f"    mom10 = 近10个交易日涨幅 (T-10 至 T-1 收盘价涨幅)")
     print(f"    vol5  = 今日成交量 / 近5日平均成交量 (<1 缩量, >1 放量)")
+    print(f"    rc    = 今日收盘相对昨收涨跌幅")
+    print(f"    calendar_diff = 上市委通过到当前信号日的自然日差")
     print(f"  卖出说明: exit=REG 表示发现'同意注册'后次日卖出")
     print(f"  策略说明:")
     for s in strategies:
@@ -1374,6 +1414,7 @@ def mode_backtest(cache, strategies, limit=None):
     print(f"\n{'=' * 110}")
     print(f"注册前信号回测")
     print(f'{"=" * 110}')
+    print(f"  回测范围: {BACKTEST_START_DATE} 及之后")
 
     pool = build_backtest_pool(cache, strategies, check_interval=2)
     if limit:

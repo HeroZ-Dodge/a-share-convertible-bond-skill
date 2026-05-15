@@ -22,7 +22,7 @@
   --sell CODE DATE PRICE [REG_DATE]  记录实际卖出
 
 回测模式:
-  --backtest              6个策略独立回测 (L=100/150/200)
+  --backtest              6个策略独立回测 (仅 2024-01-01 及之后样本, L=100/150/200)
   --backtest --combo      组合回测 (union=任一触发, intersection=全部触发)
   --backtest --combo all  组合回测 (union + 至少2个 + 全部触发)
   --backtest --limit 150  指定limit
@@ -38,6 +38,8 @@ from lib.baostock_market_db import BaoStockMarketDB
 from lib.backtest_cache import BacktestCache
 from lib.strategies import registry
 from lib.monitor_db import MonitorDB
+
+BACKTEST_START_DATE = '2024-01-01'
 
 
 def _dw(s):
@@ -159,6 +161,14 @@ def calc_factors(cache, sc, anchor, as_of_date=None):
         current_close = 0
         current_date = sd[-1] if sd else ''
 
+    calendar_diff = 0
+    if current_date and anchor:
+        try:
+            calendar_diff = (datetime.strptime(current_date, '%Y-%m-%d') -
+                             datetime.strptime(anchor, '%Y-%m-%d')).days
+        except ValueError:
+            calendar_diff = 0
+
     # Trading days since registration
     days_since = 0
     for i in range(ri + 1, len(sd)):
@@ -173,6 +183,7 @@ def calc_factors(cache, sc, anchor, as_of_date=None):
     return {
         'pre3': pre3, 'mom10': mom10, 'rc': rc, 'vol_ratio5': vol_ratio5,
         'consec_down': consec_down,
+        'calendar_diff': calendar_diff,
         'buy_price': buy_price,
         'current_close': current_close,
         'current_date': current_date,
@@ -192,13 +203,57 @@ def find_first_signal(cache, stock_code, anchor, today_str):
     if start_idx >= len(sd):
         return '', {}, []
 
+    try:
+        anchor_dt = datetime.strptime(anchor, '%Y-%m-%d')
+    except ValueError:
+        return '', {}, []
+
     for idx in range(start_idx, len(sd)):
         signal_date = sd[idx]
         if signal_date > today_str:
             break
-        factors = calc_factors(cache, stock_code, signal_date, as_of_date=today_str)
-        if not factors:
+        reg_close = prices[signal_date]['close']
+        if reg_close <= 0 or idx < 10:
             continue
+
+        pre3 = ((reg_close - prices[sd[idx-3]]['close']) / prices[sd[idx-3]]['close'] * 100) if idx >= 3 else 0
+        mom10 = ((reg_close - prices[sd[idx-10]]['close']) / prices[sd[idx-10]]['close'] * 100) if idx >= 10 else 0
+        rc = ((reg_close - prices[sd[idx-1]]['close']) / prices[sd[idx-1]]['close'] * 100) if idx > 0 else 0
+
+        vol_now = prices[signal_date].get('volume', 0)
+        vol_avg5 = 0
+        if idx >= 5:
+            vlist = [prices[sd[idx-k]].get('volume', 0) for k in range(1, 6)
+                     if prices[sd[idx-k]].get('volume', 0) > 0]
+            if vlist:
+                vol_avg5 = sum(vlist) / len(vlist)
+        vol_ratio5 = (vol_now / vol_avg5) if vol_avg5 > 0 else 1
+
+        consec_down = 0
+        for k in range(1, idx):
+            prev_c = prices[sd[idx - k]]['close']
+            curr_c = reg_close if k == 1 else prices[sd[idx - k + 1]]['close']
+            if curr_c < prev_c:
+                consec_down += 1
+            else:
+                break
+
+        calendar_diff = (datetime.strptime(signal_date, '%Y-%m-%d') - anchor_dt).days
+        buy_idx = idx + 1
+        buy_price = prices[sd[buy_idx]].get('open', 0) if buy_idx < len(sd) else None
+        factors = {
+            'pre3': pre3,
+            'mom10': mom10,
+            'rc': rc,
+            'vol_ratio5': vol_ratio5,
+            'consec_down': consec_down,
+            'calendar_diff': calendar_diff,
+            'buy_price': buy_price,
+            'current_close': reg_close,
+            'current_date': signal_date,
+            'days_since': calendar_diff,
+            'pnl_pct': None,
+        }
         triggered = check_strategies(factors)
         active_triggered = {k: v for k, v in triggered.items() if k in registry.active_keys()}
         if any(active_triggered.values()):
@@ -227,9 +282,12 @@ def _anchor_signal_meta_from_row(row):
 # registry.active_keys() — 已启用策略的 key 列表
 
 
-def check_strategies(factors):
+def check_strategies(factors, scope=None):
     """检查所有策略触发情况"""
-    return {s.key: s.matches(factors) for s in registry.all()}
+    strategies = registry.all()
+    if scope:
+        strategies = [s for s in strategies if getattr(s, 'scope', 'reg') == scope]
+    return {s.key: s.matches(factors) for s in strategies}
 
 
 # ========== 数据池构建（回测用） ==========
@@ -255,6 +313,8 @@ def build_pool(cache):
                     anchor = m.group(1)
                     break
         if not anchor or anchor > today_str:
+            continue
+        if anchor < BACKTEST_START_DATE:
             continue
 
         prices = cache.get_kline_as_dict(sc, days=1500, skip_freshness_check=True)
@@ -320,7 +380,7 @@ def build_pool(cache):
             continue
 
         # Strategy triggers
-        triggered = check_strategies(factors)
+        triggered = check_strategies(factors, scope='reg')
         hit_count = sum(1 for v in triggered.values() if v)
 
         pool.append({
@@ -442,6 +502,146 @@ def run_backtest_combo(pool, mode):
     return d9, tp
 
 
+def run_backtest_hold_single(cache, key, limit=0):
+    """单个持有期策略回测（按首个触发日）"""
+    s = registry.get(key)
+    if not s or getattr(s, 'scope', 'reg') != 'hold':
+        return None, None
+
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    bonds = cache.get_jisilu_bonds(phase='注册', limit=0)
+    candidates = []
+    for b in bonds:
+        sc = b.get('stock_code')
+        if not sc:
+            continue
+        pf = b.get('progress_full', '')
+        if not pf:
+            continue
+        anchor = ''
+        for line in pf.replace('<br>', '\n').split('\n'):
+            if '同意注册' in line:
+                m = re.search(r'(\d{4}-\d{2}-\d{2})', line)
+                if m:
+                    anchor = m.group(1)
+                    break
+        if not anchor or anchor < BACKTEST_START_DATE:
+            continue
+        candidates.append((anchor, b))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    if limit:
+        candidates = candidates[:limit]
+
+    trades = []
+    for anchor, b in candidates:
+        sc = b.get('stock_code')
+        prices = cache.get_kline_as_dict(sc, days=1500, skip_freshness_check=True)
+        if not prices:
+            continue
+        sd = sorted(prices.keys())
+        ri = find_idx(sd, anchor)
+        if ri >= len(sd) - 1:
+            continue
+        try:
+            reg_dt = datetime.strptime(anchor, '%Y-%m-%d')
+        except ValueError:
+            continue
+
+        signal_idx = None
+        signal_factors = None
+        for idx in range(ri + 1, len(sd)):
+            signal_date = sd[idx]
+            if signal_date > today_str:
+                break
+            reg_close = prices[signal_date]['close']
+            if reg_close <= 0 or idx < 10:
+                continue
+
+            pre3 = ((reg_close - prices[sd[idx - 3]]['close']) / prices[sd[idx - 3]]['close'] * 100) if idx >= 3 else 0
+            mom10 = ((reg_close - prices[sd[idx - 10]]['close']) / prices[sd[idx - 10]]['close'] * 100) if idx >= 10 else 0
+            rc = ((reg_close - prices[sd[idx - 1]]['close']) / prices[sd[idx - 1]]['close'] * 100) if idx > 0 else 0
+
+            vol_now = prices[signal_date].get('volume', 0)
+            vol_avg5 = 0
+            if idx >= 5:
+                vlist = [prices[sd[idx - k]].get('volume', 0) for k in range(1, 6)
+                         if prices[sd[idx - k]].get('volume', 0) > 0]
+                if vlist:
+                    vol_avg5 = sum(vlist) / len(vlist)
+            vol_ratio5 = (vol_now / vol_avg5) if vol_avg5 > 0 else 1
+
+            consec_down = 0
+            for k in range(1, idx):
+                prev_c = prices[sd[idx - k]]['close']
+                curr_c = reg_close if k == 1 else prices[sd[idx - k + 1]]['close']
+                if curr_c < prev_c:
+                    consec_down += 1
+                else:
+                    break
+
+            calendar_diff = (datetime.strptime(signal_date, '%Y-%m-%d') - reg_dt).days
+            factors = {
+                'pre3': pre3,
+                'mom10': mom10,
+                'rc': rc,
+                'vol_ratio5': vol_ratio5,
+                'consec_down': consec_down,
+                'calendar_diff': calendar_diff,
+                'buy_price': None,
+                'current_close': reg_close,
+                'current_date': signal_date,
+                'days_since': calendar_diff,
+                'pnl_pct': None,
+            }
+            if s.matches(factors):
+                signal_idx = idx
+                signal_factors = factors
+                break
+
+        if signal_idx is None or signal_factors is None:
+            continue
+
+        buy_idx = signal_idx + 1
+        if buy_idx >= len(sd):
+            continue
+        buy_price = prices[sd[buy_idx]].get('open', 0)
+        if not buy_price or buy_price <= 0:
+            continue
+
+        hold_days = []
+        for off in range(1, 21):
+            idx = signal_idx + off
+            if idx >= len(sd) or sd[idx] > today_str:
+                break
+            p = prices[sd[idx]]
+            hold_days.append({
+                'off': off, 'date': sd[idx],
+                'open': p.get('open', 0), 'close': p.get('close', 0),
+                'high': p.get('high', 0), 'low': p.get('low', 0),
+            })
+        if len(hold_days) < 2:
+            continue
+
+        trades.append({
+            'code': sc,
+            'name': (b.get('bond_name') or b.get('stock_name') or '?')[:12],
+            'anchor': anchor,
+            'signal_date': signal_factors['current_date'],
+            'factors': signal_factors,
+            'triggered': {key: True},
+            'hit_count': 1,
+            'buy_price': buy_price,
+            'hold_days': hold_days,
+        })
+
+    if not trades:
+        return None, None
+    d9 = test_d9_exit(trades)
+    tp = test_tp5_sl5_exit(trades)
+    return d9, tp
+
+
 def combo_label(mode):
     """组合模式标签"""
     labels = {
@@ -460,6 +660,7 @@ def mode_backtest(cache, combo_mode=None):
     print("\n" + "=" * 110)
     print("多策略回测")
     print("=" * 110)
+    print(f"  回测范围: {BACKTEST_START_DATE} 及之后")
 
     pool = build_pool(cache)
     total = len(pool)
@@ -497,6 +698,8 @@ def mode_backtest(cache, combo_mode=None):
 
     else:
         # 独立策略回测
+        reg_keys = [k for k in registry.active_keys()
+                    if getattr(registry.get(k), 'scope', 'reg') == 'reg']
         print(f"\n" + "-" * 110)
         print(f"  独立策略回测 (D+9 固定退出)")
         print(f"{'-'*110}")
@@ -511,7 +714,7 @@ def mode_backtest(cache, combo_mode=None):
         print(sub)
         print("  " + "-" * (_dw(hdr) - 2))
 
-        for key in registry.active_keys():
+        for key in reg_keys:
             parts = []
             for limit in [100, 150, 200, 0]:
                 pl = pool[:limit] if limit else pool
@@ -537,7 +740,7 @@ def mode_backtest(cache, combo_mode=None):
         print(sub)
         print("  " + "-" * (_dw(hdr) - 2))
 
-        for key in registry.active_keys():
+        for key in reg_keys:
             parts = []
             for limit in [100, 150, 200, 0]:
                 pl = pool[:limit] if limit else pool
@@ -561,7 +764,7 @@ def mode_backtest(cache, combo_mode=None):
         print(hdr)
         print("  " + "-" * (_dw(hdr) - 2))
 
-        for key in registry.active_keys():
+        for key in reg_keys:
             shards = []
             for limit in [100, 150, 200, 0]:
                 pl = pool[:limit] if limit else pool
@@ -576,6 +779,35 @@ def mode_backtest(cache, combo_mode=None):
             parts_s.append(_pad(trend, 10))
             print(f"  {_pad(_display_name(key), 42)} {' '.join(parts_s)}")
 
+        hold_keys = [k for k in registry.active_keys()
+                     if getattr(registry.get(k), 'scope', 'reg') == 'hold']
+        if hold_keys:
+            print(f"\n" + "-" * 110)
+            print(f"  持有期策略回测 (首个触发日)")
+            print(f"{'-'*110}")
+
+            hdr = f"  {_pad('策略', 42)}"
+            for lim in ['L=100', 'L=150', 'L=200', '全量']:
+                hdr += f" {_pad(lim, 30)}"
+            print(hdr)
+            sub = f"  {_pad('', 42)}"
+            for _ in range(4):
+                sub += f" {_pad('n avg sh eff', 30)}"
+            print(sub)
+            print("  " + "-" * (_dw(hdr) - 2))
+
+            for key in hold_keys:
+                parts = []
+                for limit in [100, 150, 200, 0]:
+                    d9, tp = run_backtest_hold_single(cache, key, limit)
+                    if tp:
+                        eff = tp['avg'] / tp['avg_hold'] * 245 if tp['avg_hold'] > 0 else 0
+                        val = f"{tp['n']} {tp['avg']:+.1f}% sh={tp['sharpe']:+.2f} eff={eff:+.0f}%"
+                        parts.append(_pad(val, 30))
+                    else:
+                        parts.append(_pad('--', 30))
+                print(f"  {_pad(_display_name(key), 42)} {' '.join(parts)}")
+
     # 年份分组（只对L=200和全量）
     print(f"\n" + "-" * 110)
     print(f"  按年份分组 (L=200, TP5/SL5)")
@@ -583,7 +815,10 @@ def mode_backtest(cache, combo_mode=None):
 
     pool_200 = pool[:200]
     for key in registry.active_keys():
-        s_cond = registry.get(key).condition
+        s_obj = registry.get(key)
+        if not s_obj or getattr(s_obj, 'scope', 'reg') != 'reg':
+            continue
+        s_cond = s_obj.condition
         print(f"\n  {_display_name(key)}:")
         hdr = f"    {_pad('年份', 8)} {_pad('样本', 4)} {_pad('平均', 7)} {_pad('胜率', 6)} {_pad('夏普', 6)} {_pad('年化', 8)}"
         print(hdr)
@@ -644,9 +879,17 @@ def scan_registrations(cache):
         triggered = check_strategies(factors)
         hit_count = sum(1 for v in triggered.values() if v)
         active_triggered = {k: v for k, v in triggered.items() if k in registry.active_keys()}
-        first_signal_date = anchor if any(active_triggered.values()) else ''
-        first_signal_triggered = active_triggered
-        first_signal_labels = [_short_name(k) for k in registry.active_keys() if active_triggered.get(k)]
+        first_signal_date = ''
+        first_signal_triggered = {}
+        first_signal_labels = []
+        if any(active_triggered.values()):
+            first_signal_date, first_signal_triggered, first_signal_labels = find_first_signal(
+                cache, sc, anchor, today_str
+            )
+            if not first_signal_date:
+                first_signal_date = anchor
+                first_signal_triggered = active_triggered
+                first_signal_labels = [_short_name(k) for k in registry.active_keys() if active_triggered.get(k)]
 
         results.append({
             'code': sc,
