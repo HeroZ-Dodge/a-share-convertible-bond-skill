@@ -29,6 +29,13 @@ from lib.backtest_cache import BacktestCache
 
 BACKTEST_START_DATE = '2024-01-01'
 MAX_HOLD_DAYS = 20
+# 默认只扫更小的参数空间，兼顾速度和可用性
+GRID_AGE_LOW = [4, 5]
+GRID_AGE_HIGH = [12, 14]
+GRID_PRE_MAX = [-1, 0]
+GRID_MOM_MIN = [-1, 0]
+GRID_RC_MIN = [-1, 0]
+GRID_VOL_MAX = [0.9, 1.0]
 
 
 def find_idx(dates, target):
@@ -292,12 +299,12 @@ def grid_search(samples, top_n=20):
     """简单网格搜索"""
     candidates = []
     for age_lo, age_hi, pre_max, mom_min, rc_min, vol_max in product(
-        [4, 5, 6],
-        [10, 12, 14],
-        [-2, -1, 0],
-        [-1, 0, 1],
-        [-1, 0],
-        [0.9, 1.0],
+        GRID_AGE_LOW,
+        GRID_AGE_HIGH,
+        GRID_PRE_MAX,
+        GRID_MOM_MIN,
+        GRID_RC_MIN,
+        GRID_VOL_MAX,
     ):
         if age_lo >= age_hi:
             continue
@@ -343,7 +350,7 @@ def main():
     args = sys.argv[1:]
     do_backtest = '--backtest' in args or '--mine' in args
     do_mine = '--mine' in args
-    top_n = 20
+    top_n = 10
     limit = 0
 
     for i, arg in enumerate(args):
