@@ -32,9 +32,6 @@ except ImportError:  # 直接运行脚本时回退为绝对导入
 # 交易日历缓存：30分钟内复用同一结果，避免频繁调API
 _latest_trade_date_cache: Dict[str, Any] = {'time': 0, 'date': ''}
 
-# 单只股票 K 线刷新缓存：30分钟内不重复刷新同一只股票，大幅减少API调用
-_kline_refresh_cache: Dict[str, float] = {}  # {stock_code: last_refresh_time}
-
 
 class BacktestCache:
     """回测缓存数据库管理"""
@@ -803,6 +800,19 @@ class BacktestCache:
         """
         return self.market_db.ensure_kline(stock_code, days=days, refresh=True)
 
+    def backfill_kline_history(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """显式回填更早历史 K 线到本地 BaoStock 库。"""
+        return self.market_db.backfill_kline_history(
+            stock_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
     def get_kline_data(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
         """获取 K 线数据列表。"""
         return self.market_db.get_kline_data(stock_code, days=days)
@@ -1285,6 +1295,18 @@ class BacktestCache:
                 'SELECT COUNT(*) FROM eastmoney_limit_up'
             ).fetchone()[0]
             return stats
+
+    def get_jisilu_status_counts(self) -> Dict[str, int]:
+        """返回 jisilu_bonds 按 status_cd 的数量统计。"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                '''
+                SELECT status_cd, COUNT(*) AS cnt
+                FROM jisilu_bonds
+                GROUP BY status_cd
+                '''
+            ).fetchall()
+        return {row['status_cd'] or '': row['cnt'] for row in rows}
 
 
 # ==================== 全局缓存实例 ====================

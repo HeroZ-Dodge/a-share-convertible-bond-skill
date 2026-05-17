@@ -630,7 +630,8 @@ class BaoStockAPI:
         """获取股票日线，默认不复权"""
         code = self._market_symbol(stock_code)
         end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=max(days * 3, 3650))).strftime('%Y-%m-%d')
+        lookback_days = min(max(days * 2, 365), 1000)
+        start_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
         fields = 'date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST'
 
         def _query(bs):

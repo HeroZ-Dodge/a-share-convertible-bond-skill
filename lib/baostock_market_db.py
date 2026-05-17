@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 _latest_trade_date_cache: Dict[str, Any] = {'time': 0.0, 'date': ''}
+_kline_refresh_cache: Dict[str, float] = {}
 _bs_session_lock = threading.Lock()
 
 
@@ -30,7 +31,8 @@ class BaoStockMarketDB:
         self,
         db_path: Optional[str] = None,
         adjustflag: str = '3',
-        min_initial_days: int = 1500,
+        min_initial_days: int = 365,
+        max_initial_days: int = 1000,
     ) -> None:
         if db_path is None:
             db_path = os.path.join(
@@ -40,6 +42,7 @@ class BaoStockMarketDB:
         self.db_path = db_path
         self.adjustflag = adjustflag
         self.min_initial_days = min_initial_days
+        self.max_initial_days = max_initial_days
         self._bs = None
         self._bs_logged_in = False
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -107,7 +110,13 @@ class BaoStockMarketDB:
             if self._bs is not None and self._bs_logged_in:
                 return self._bs
 
-            import baostock as bs
+            try:
+                import baostock as bs
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "缺少依赖 baostock。请先在虚拟环境中安装："
+                    "`python -m pip install baostock`"
+                ) from exc
 
             with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
                 lg = bs.login()
@@ -248,6 +257,15 @@ class BaoStockMarketDB:
                 _latest_trade_date_cache = {'time': time.time(), 'date': trade_dates[-1]}
         return len(rows)
 
+    def _refresh_recently(self, stock_code: str, min_interval: int = 1800) -> bool:
+        """判断某只股票是否刚刚刷新过。"""
+        last = _kline_refresh_cache.get(stock_code, 0.0)
+        return bool(last and (time.time() - last) < min_interval)
+
+    def _mark_refreshed(self, stock_code: str) -> None:
+        """记录某只股票的最近刷新时间。"""
+        _kline_refresh_cache[stock_code] = time.time()
+
     def _get_local_rows(self, stock_code: str) -> List[sqlite3.Row]:
         with self._get_conn() as conn:
             cursor = conn.execute(
@@ -311,44 +329,136 @@ class BaoStockMarketDB:
 
         规则：
         - 本地为空时，按需回填一个足够覆盖 days 的历史窗口
-        - 本地存在时，只补最新缺口
+        - 本地存在时，默认做增量更新
+        - 若当前最新交易日已在本地，则在刷新间隔到期后覆盖更新最新交易日
         - refresh=False 时不主动检查最新交易日，只读取本地并在必要时补初始窗口
         """
         local_rows = self._get_local_rows(stock_code)
+        today_str = datetime.now().strftime('%Y-%m-%d')
+
         if not local_rows:
             end_date = self.get_latest_trading_date() or datetime.now().strftime('%Y-%m-%d')
-            lookback_days = max(days * 3, self.min_initial_days)
+            lookback_days = min(max(days * 2, self.min_initial_days), self.max_initial_days)
             start_date = (datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
             rows = self._fetch_kline(stock_code, start_date, end_date)
             if rows:
                 self._store_rows(stock_code, rows)
+                self._mark_refreshed(stock_code)
                 return self.get_kline_data(stock_code, days=days)
             return []
 
         if refresh:
+            if self._refresh_recently(stock_code):
+                return self.get_kline_data(stock_code, days=days)
+
             latest_trade_date = self.get_latest_trading_date()
             local_latest = local_rows[0]['trade_date']
+            fetch_start_date = ''
+
             if latest_trade_date and local_latest < latest_trade_date:
-                start_date = (datetime.fromisoformat(local_latest) + timedelta(days=1)).strftime('%Y-%m-%d')
-                rows = self._fetch_kline(stock_code, start_date, latest_trade_date)
+                fetch_start_date = (datetime.fromisoformat(local_latest) + timedelta(days=1)).strftime('%Y-%m-%d')
+            elif latest_trade_date and local_latest == latest_trade_date and latest_trade_date == today_str:
+                # 盘中同日覆盖：同一天多次请求时，用最新数据替换当天K线
+                fetch_start_date = local_latest
+
+            if fetch_start_date:
+                end_date = latest_trade_date or today_str
+                rows = self._fetch_kline(stock_code, fetch_start_date, end_date)
                 if rows:
                     self._store_rows(stock_code, rows)
+                    self._mark_refreshed(stock_code)
 
         return self.get_kline_data(stock_code, days=days)
 
+    def backfill_kline_history(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        显式回填更早历史区间到本地库。
+
+        仅供研究/回测补历史使用，不改变日常增量同步逻辑。
+        """
+        if not start_date:
+            return []
+
+        if end_date is None:
+            local_rows = self._get_local_rows(stock_code)
+            if local_rows:
+                end_date = local_rows[-1]['trade_date']
+            else:
+                end_date = self.get_latest_trading_date() or datetime.now().strftime('%Y-%m-%d')
+
+        if not end_date or start_date > end_date:
+            return []
+        local_rows = self._get_local_rows(stock_code)
+        local_dates = [row['trade_date'] for row in local_rows if row['trade_date']]
+        local_earliest = min(local_dates) if local_dates else ''
+        local_latest = max(local_dates) if local_dates else ''
+
+        fetch_ranges: List[tuple[str, str]] = []
+        if not local_rows:
+            fetch_ranges.append((start_date, end_date))
+        else:
+            if start_date < local_earliest:
+                left_end = min(end_date, (datetime.fromisoformat(local_earliest) - timedelta(days=1)).strftime('%Y-%m-%d'))
+                if start_date <= left_end:
+                    fetch_ranges.append((start_date, left_end))
+            if end_date > local_latest:
+                right_start = max(start_date, (datetime.fromisoformat(local_latest) + timedelta(days=1)).strftime('%Y-%m-%d'))
+                if right_start <= end_date:
+                    fetch_ranges.append((right_start, end_date))
+
+        if not fetch_ranges:
+            return self.get_kline_data(stock_code, days=100000)
+
+        total_written = 0
+        chunk_days = 180
+        for range_start, range_end in fetch_ranges:
+            cursor = datetime.fromisoformat(range_start)
+            final_end = datetime.fromisoformat(range_end)
+            while cursor <= final_end:
+                chunk_end = min(cursor + timedelta(days=chunk_days - 1), final_end)
+                rows = self._fetch_kline(
+                    stock_code,
+                    cursor.strftime('%Y-%m-%d'),
+                    chunk_end.strftime('%Y-%m-%d'),
+                )
+                if rows:
+                    total_written += self._store_rows(stock_code, rows)
+                cursor = chunk_end + timedelta(days=1)
+
+        if total_written:
+            self._mark_refreshed(stock_code)
+        return self.get_kline_data(stock_code, days=100000)
+
     def get_kline_data(self, stock_code: str, days: int = 90) -> List[Dict[str, Any]]:
         """获取 K 线数据列表。"""
+        return self.get_kline_data_until(stock_code, days=days)
+
+    def get_kline_data_until(
+        self,
+        stock_code: str,
+        days: int = 90,
+        end_date: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """获取截止某个日期的 K 线数据列表。"""
+        sql = '''
+            SELECT *
+            FROM stock_daily
+            WHERE stock_code = ?
+        '''
+        params: List[Any] = [stock_code]
+        if end_date:
+            sql += ' AND trade_date <= ?'
+            params.append(end_date)
+        sql += ' ORDER BY trade_date DESC LIMIT ?'
+        params.append(days)
+
         with self._get_conn() as conn:
-            cursor = conn.execute(
-                '''
-                SELECT *
-                FROM stock_daily
-                WHERE stock_code = ?
-                ORDER BY trade_date DESC
-                LIMIT ?
-                ''',
-                (stock_code, days),
-            )
+            cursor = conn.execute(sql, tuple(params))
             return [dict(row) for row in cursor.fetchall()]
 
     def get_kline_as_dict(
@@ -368,8 +478,9 @@ class BaoStockMarketDB:
         if not rows:
             return {}
 
-        if as_of_date and rows and rows[0]['trade_date'] == as_of_date:
-            rows = rows[1:]
+        rows = self.get_kline_data_until(stock_code, days=days, end_date=as_of_date)
+        if not rows:
+            return {}
 
         rows = rows[:days] if days > 0 else rows
 

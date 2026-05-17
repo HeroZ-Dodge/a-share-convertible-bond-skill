@@ -9,6 +9,10 @@
   - 支持固定候选规则回测和简单网格搜索
 
 用法：
+  --scan                    扫描今日注册后信号
+  --hold                    查看理论持仓监控
+  --status                  查看全部注册后事件
+  --once                    默认等价于 --status
   --backtest                 回测内置候选规则
   --mine                     网格搜索最优规则
   --limit 100                只取最近 N 只样本
@@ -19,15 +23,18 @@ from __future__ import annotations
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import product
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from lib.cache_sync import ensure_jisilu_cache, sync_kline_cache
 from lib.backtest_cache import BacktestCache
 
 BACKTEST_START_DATE = '2024-01-01'
+MONITOR_KLINE_DAYS = 1000
 MAX_HOLD_DAYS = 20
 # 默认只扫更小的参数空间，兼顾速度和可用性
 GRID_AGE_LOW = [4, 5]
@@ -93,6 +100,57 @@ def _calendar_diff(left: str, right: str) -> int:
         return 0
 
 
+def _dw(s):
+    """Calculate display width (CJK chars = 2 cols)."""
+    width = 0
+    for c in str(s):
+        if c in ('\u200d', '\ufe0e', '\ufe0f') or unicodedata.combining(c):
+            continue
+        width += 2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1
+    return width
+
+
+def _pad(s, width, left=True):
+    """Pad/truncate string to target display width."""
+    s = str(s)
+    dw = _dw(s)
+    if dw >= width:
+        result, used = '', 0
+        for c in s:
+            if c in ('\u200d', '\ufe0e', '\ufe0f') or unicodedata.combining(c):
+                cw = 0
+            elif unicodedata.east_asian_width(c) in ('F', 'W'):
+                cw = 2
+            else:
+                cw = 1
+            if used + cw > width:
+                break
+            result += c
+            used += cw
+        return result + ' ' * (width - used)
+    padding = width - dw
+    return s + ' ' * padding if left else ' ' * padding + s
+
+
+def _labels_text(labels, default='—'):
+    """把标签压成展示文本。"""
+    if not labels:
+        return default
+    if isinstance(labels, str):
+        text = labels.strip()
+        return text or default
+    items = [str(x).strip() for x in labels if str(x).strip()]
+    return '/'.join(items) if items else default
+
+
+def _format_t_plus(days, width=6):
+    """格式化 T+N。"""
+    try:
+        return _pad(f"T+{int(days)}", width)
+    except (TypeError, ValueError):
+        return _pad('--', width)
+
+
 @dataclass(frozen=True)
 class HoldRule:
     key: str
@@ -134,11 +192,10 @@ RULES = [
 ]
 
 
-def build_samples(cache, limit=0):
-    """构建历史样本缓存：每只债券保留注册后完整价格序列"""
+def _collect_candidates(cache, limit=0, start_date=BACKTEST_START_DATE):
+    """按 progress_full 解析出可监控的注册样本候选。"""
     today_str = datetime.now().strftime('%Y-%m-%d')
     bonds = cache.get_jisilu_bonds(phase='注册', limit=0)
-    samples = []
     candidates = []
 
     for b in bonds:
@@ -146,17 +203,22 @@ def build_samples(cache, limit=0):
         if not sc:
             continue
         anchor = parse_anchor(b.get('progress_full', ''))
-        if not anchor or anchor < BACKTEST_START_DATE or anchor > today_str:
+        if not anchor or anchor < start_date or anchor > today_str:
             continue
         candidates.append((anchor, b))
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     if limit:
         candidates = candidates[:limit]
+    return candidates
 
-    for anchor, b in candidates:
+
+def build_samples(cache, limit=0, start_date=BACKTEST_START_DATE):
+    """构建历史样本缓存：每只债券保留注册后完整价格序列"""
+    samples = []
+    for anchor, b in _collect_candidates(cache, limit=limit, start_date=start_date):
         sc = b.get('stock_code')
-        prices = cache.get_kline_as_dict(sc, days=1500, skip_freshness_check=True)
+        prices = cache.get_kline_as_dict(sc, days=MONITOR_KLINE_DAYS, skip_freshness_check=True)
         if not prices:
             continue
         sd = sorted(prices.keys())
@@ -167,6 +229,7 @@ def build_samples(cache, limit=0):
             'code': sc,
             'name': (b.get('bond_name') or b.get('stock_name') or '?')[:12],
             'anchor': anchor,
+            'year': anchor[:4],
             'prices': prices,
             'dates': sd,
             'reg_idx': ri,
@@ -181,7 +244,6 @@ def compute_factors(sample, idx):
     sd = sample['dates']
     anchor = sample['anchor']
     reg_idx = sample['reg_idx']
-    reg_dt = datetime.strptime(anchor, '%Y-%m-%d')
     signal_date = sd[idx]
     reg_close = prices[signal_date]['close']
     if reg_close <= 0 or idx < 10:
@@ -210,7 +272,8 @@ def compute_factors(sample, idx):
         else:
             break
 
-    age = _calendar_diff(signal_date, anchor)
+    calendar_diff = _calendar_diff(signal_date, anchor)
+    days_since = max(0, idx - reg_idx)
     buy_idx = idx + 1
     buy_price = prices[sd[buy_idx]].get('open', 0) if buy_idx < len(sd) else 0
 
@@ -221,7 +284,9 @@ def compute_factors(sample, idx):
         'rc': rc,
         'vol_ratio5': vol_ratio5,
         'consec_down': consec_down,
-        'age': age,
+        'age': calendar_diff,
+        'calendar_diff': calendar_diff,
+        'days_since': days_since,
         'buy_price': buy_price,
         'signal_date': signal_date,
         'current_close': reg_close,
@@ -278,11 +343,155 @@ def first_match_trade(sample, cond):
             'hold': exit_off - 1,
             'signal_date': factors['signal_date'],
             'age': factors['age'],
+            'year': sample['year'],
             'buy_price': buy_price,
             'signal_factors': factors,
         }
 
     return None
+
+
+def _first_signal_meta(sample):
+    """找到注册后首次触发的信号。"""
+    sd = sample['dates']
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    for idx in range(sample['reg_idx'] + 1, len(sd)):
+        if sd[idx] > today_str:
+            break
+        factors = compute_factors(sample, idx)
+        if not factors:
+            continue
+        triggered = {rule.key: bool(rule.condition(factors)) for rule in RULES}
+        if any(triggered.values()):
+            labels = [rule.display_name for rule in RULES if triggered.get(rule.key)]
+            return {
+                'signal_date': sd[idx],
+                'signal_idx': idx,
+                'triggered': triggered,
+                'labels': labels,
+                'factors': factors,
+            }
+    return {
+        'signal_date': '',
+        'signal_idx': None,
+        'triggered': {},
+        'labels': [],
+        'factors': None,
+    }
+
+
+def build_monitor_rows(cache, limit=0):
+    """构建日常监控用的注册后数据池。"""
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    rows = []
+
+    for anchor, b in _collect_candidates(cache, limit=limit):
+        sc = b.get('stock_code')
+        prices = cache.get_kline_as_dict(sc, days=MONITOR_KLINE_DAYS, as_of_date=today_str)
+        if not prices:
+            continue
+
+        sd = sorted(prices.keys())
+        reg_idx = find_idx(sd, anchor)
+        if reg_idx >= len(sd) - 1:
+            continue
+
+        sample = {
+            'code': sc,
+            'name': (b.get('bond_name') or b.get('stock_name') or '?')[:12],
+            'anchor': anchor,
+            'prices': prices,
+            'dates': sd,
+            'reg_idx': reg_idx,
+        }
+        current_idx = len(sd) - 1
+        current_factors = compute_factors(sample, current_idx)
+        if not current_factors:
+            continue
+        if current_factors.get('calendar_diff', 0) < 0 or current_factors.get('calendar_diff', 0) > MAX_HOLD_DAYS:
+            continue
+
+        current_triggered = {rule.key: bool(rule.condition(current_factors)) for rule in RULES}
+        current_labels = [rule.display_name for rule in RULES if current_triggered.get(rule.key)]
+        first_meta = _first_signal_meta(sample)
+        entry_buy_price = 0
+        if first_meta.get('factors'):
+            entry_buy_price = first_meta['factors'].get('buy_price', 0) or 0
+
+        rows.append({
+            'code': sc,
+            'name': sample['name'],
+            'anchor': anchor,
+            'current_date': current_factors['signal_date'],
+            'calendar_diff': current_factors.get('calendar_diff', 0),
+            'days_since': current_factors.get('days_since', 0),
+            'current_close': current_factors.get('current_close', 0),
+            'buy_price': current_factors.get('buy_price', 0),
+            'entry_buy_price': entry_buy_price,
+            'factors': current_factors,
+            'triggered': current_triggered,
+            'current_labels': current_labels,
+            'first_signal_date': first_meta['signal_date'],
+            'first_signal_labels': first_meta['labels'],
+            'first_signal_triggered': first_meta['triggered'],
+            'hold_days': (
+                current_factors['days_since'] - (first_meta['signal_idx'] - reg_idx)
+                if first_meta['signal_idx'] is not None else 0
+            ),
+            'sample': sample,
+        })
+
+    rows.sort(key=lambda x: x['anchor'], reverse=True)
+    return rows
+
+
+def _print_signal_table(title, rows):
+    print(f"\n  📢 {title} ({len(rows)}只):")
+    hdr = (
+        f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} "
+        f"{_pad('T+', 6)} {_pad('现价', 8)} {_pad('首次信号', 16)} "
+        f"{_pad('首次策略', 18)} {_pad('当天策略', 18)}"
+    )
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
+    if not rows:
+        print("  无信号")
+        return
+    for row in rows:
+        current_close = f"{row['current_close']:.2f}" if row.get('current_close') else '--'
+        print(
+            f"  {_pad(row['name'], 14)} {_pad(row['code'], 8)} {_pad(row['anchor'], 16)} "
+            f"{_format_t_plus(row.get('days_since', 0), 6)} {_pad(current_close, 8)} "
+            f"{_pad(row.get('first_signal_date') or '--', 16)} "
+            f"{_pad(_labels_text(row.get('first_signal_labels', [])), 18)} "
+            f"{_pad(_labels_text(row.get('current_labels', [])), 18)}"
+        )
+
+
+def _print_hold_table(title, rows):
+    print(f"\n  📊 {title} ({len(rows)}只):")
+    hdr = (
+        f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('T+', 6)} {_pad('买价', 8)} "
+        f"{_pad('现价', 8)} {_pad('盈亏', 8)} {_pad('止盈止损', 24)} {'触发策略'}"
+    )
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
+    if not rows:
+        print("  无持仓")
+        return
+    for row in rows:
+        print(
+            "  " + " ".join([
+                _pad(row['name'], 14),
+                _pad(row['code'], 8),
+                _format_t_plus(row['days'], 6),
+                _pad(row['buy_price'], 8),
+                _pad(row['current_price'], 8),
+                _pad(row['pnl'], 8),
+                _pad(row['exit_str'], 24),
+                row['tags'],
+            ])
+        )
 
 
 def backtest_rule(samples, rule):
@@ -345,13 +554,143 @@ def print_rule_stats(rule, stats):
     )
 
 
+def print_yearly_stats(rule, trades):
+    """打印规则分年统计。"""
+    if not trades:
+        print(f"    {rule.display_name}: 无年度样本")
+        return
+    by_year = {}
+    for trade in trades:
+        by_year.setdefault(trade['year'], []).append(trade)
+    for year in sorted(by_year):
+        stats = calc_stats(by_year[year])
+        if not stats:
+            continue
+        print(
+            f"    {year}: n={stats['n']:>3} avg={stats['avg']:+6.2f}% "
+            f"win={stats['win']:>5.1f}% sh={stats['sharpe']:+5.2f} hold={stats['avg_hold']:>4.1f}d"
+        )
+
+
+def mode_scan(cache, limit=0):
+    """日常扫描：今日触发信号 + 监控池。"""
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    print(f"\n{'=' * 110}")
+    print(f"注册后信号监控 — {today_str}")
+    print(f"{'=' * 110}")
+
+    pool = build_monitor_rows(cache, limit=limit)
+    triggered = [r for r in pool if any(r['triggered'].values())]
+
+    if triggered:
+        _print_signal_table("买入信号", triggered)
+    else:
+        print("\n  今日无买入信号")
+
+    print(f"\n  监控池 ({len(pool)}只):")
+    hdr = (
+        f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} {_pad('T+', 6)} "
+        f"{_pad('首次信号', 16)} {_pad('首次策略', 18)} {_pad('当天策略', 18)} "
+        f"{_pad('pre3', 7)} {_pad('mom10', 8)} {_pad('rc', 6)} {_pad('vol', 5)}"
+    )
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
+    for row in pool:
+        f = row['factors']
+        print(
+            f"  {_pad(row['name'], 14)} {_pad(row['code'], 8)} {_pad(row['anchor'], 16)} "
+            f"{_format_t_plus(row.get('days_since', 0), 6)} {_pad(row.get('first_signal_date') or '--', 16)} "
+            f"{_pad(_labels_text(row.get('first_signal_labels', [])), 18)} "
+            f"{_pad(_labels_text(row.get('current_labels', [])), 18)} "
+            f"{f['pre3']:>+6.1f}% {f['mom10']:>+7.1f}% {f['rc']:>+5.1f}% {f['vol_ratio5']:>5.2f}"
+        )
+
+
+def mode_hold(cache, limit=0):
+    """日常持仓监控：按首次信号构造理论持仓。"""
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    print(f"\n{'=' * 110}")
+    print(f"注册后持仓监控 — {today_str}")
+    print(f"{'=' * 110}")
+
+    pool = build_monitor_rows(cache, limit=limit)
+    hold_rows = []
+    for row in pool:
+        if not row.get('first_signal_date'):
+            continue
+        hold_days = row.get('hold_days', 0)
+        if hold_days < 0 or hold_days > MAX_HOLD_DAYS:
+            continue
+
+        f = row['factors']
+        buy_price = row.get('entry_buy_price', 0) or 0
+        current_price = f.get('current_close', 0)
+        pnl = '--'
+        pnl_value = None
+        if buy_price and buy_price > 0 and current_price and current_price > 0:
+            pnl_value = ((current_price - buy_price) / buy_price) * 100
+            pnl = f"{pnl_value:+.1f}%"
+
+        if pnl_value is None:
+            exit_str = '持有中'
+        elif pnl_value >= 5:
+            exit_str = '止盈'
+        elif pnl_value <= -5:
+            exit_str = '止损'
+        elif hold_days >= MAX_HOLD_DAYS:
+            exit_str = '到期退出'
+        else:
+            exit_str = '持有中'
+
+        hold_rows.append({
+            'name': row['name'],
+            'code': row['code'],
+            'days': row.get('days_since', 0),
+            'buy_price': f"{buy_price:.2f}" if buy_price else '--',
+            'current_price': f"{current_price:.2f}" if current_price else '--',
+            'pnl': pnl,
+            'exit_str': exit_str,
+            'tags': f"首:{_labels_text(row.get('first_signal_labels', []))} 今:{_labels_text(row.get('current_labels', []))}",
+        })
+
+    _print_hold_table("持仓监控", hold_rows)
+
+
+def mode_status(cache, limit=0):
+    """列出所有注册后事件及当前因子。"""
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    rows = build_monitor_rows(cache, limit=limit)
+    print(f"\n{'=' * 110}")
+    print(f"注册后事件总览 — {today_str} ({len(rows)}只)")
+    print(f"{'=' * 110}")
+
+    hdr = (
+        f"  {_pad('名称', 14)} {_pad('代码', 8)} {_pad('注册日', 16)} {_pad('T+', 6)} "
+        f"{_pad('首次信号', 16)} {_pad('首策略', 18)} {_pad('今策略', 18)} "
+        f"{_pad('pre3', 7)} {_pad('mom10', 8)} {_pad('rc', 6)} {_pad('vol', 5)}"
+    )
+    print(hdr)
+    print("  " + "-" * (_dw(hdr) - 2))
+    for row in rows:
+        f = row['factors']
+        print(
+            f"  {_pad(row['name'], 14)} {_pad(row['code'], 8)} {_pad(row['anchor'], 16)} "
+            f"{_format_t_plus(row.get('days_since', 0), 6)} {_pad(row.get('first_signal_date') or '--', 16)} "
+            f"{_pad(_labels_text(row.get('first_signal_labels', [])), 18)} "
+            f"{_pad(_labels_text(row.get('current_labels', [])), 18)} "
+            f"{f['pre3']:>+6.1f}% {f['mom10']:>+7.1f}% {f['rc']:>+5.1f}% {f['vol_ratio5']:>5.2f}"
+        )
+
+
 def main():
     cache = BacktestCache()
     args = sys.argv[1:]
+    mode = '--once'
     do_backtest = '--backtest' in args or '--mine' in args
     do_mine = '--mine' in args
     top_n = 10
     limit = 0
+    start_date = BACKTEST_START_DATE
 
     for i, arg in enumerate(args):
         if arg == '--top' and i + 1 < len(args):
@@ -364,23 +703,51 @@ def main():
                 limit = int(args[i + 1])
             except ValueError:
                 pass
+        if arg == '--start-date' and i + 1 < len(args):
+            start_date = args[i + 1]
+        if arg == '--scan':
+            mode = '--scan'
+        if arg == '--hold':
+            mode = '--hold'
+        if arg == '--status':
+            mode = '--status'
+        if arg == '--once':
+            mode = '--once'
 
     if not do_backtest:
-        print("可用: --backtest, --mine, --limit N, --top N")
+        ensure_jisilu_cache(cache)
+        candidates = _collect_candidates(cache, limit=limit, start_date=start_date)
+        sync_kline_cache(
+            cache,
+            [b.get('stock_code') for _, b in candidates],
+            days=MONITOR_KLINE_DAYS,
+            title='BaoStock K 线同步',
+        )
+        if mode == '--scan':
+            mode_scan(cache, limit=limit)
+        elif mode == '--hold':
+            mode_hold(cache, limit=limit)
+        elif mode in ('--status', '--once'):
+            mode_status(cache, limit=limit)
+        else:
+            print("可用: --scan, --hold, --status, --once, --backtest, --mine, --limit N, --top N")
         return
 
-    samples = build_samples(cache, limit=limit)
+    ensure_jisilu_cache(cache)
+    samples = build_samples(cache, limit=limit, start_date=start_date)
     print(f"\n{'=' * 100}")
     print("注册后持有期挖掘")
     print(f"{'=' * 100}")
     print(f"样本数: {len(samples)}")
+    print(f"起始日期: {start_date}")
 
     print(f"\n{'-' * 100}")
     print("内置候选规则回测 (TP5/SL5)")
     print(f"{'-' * 100}")
     for rule in RULES:
-        stats, _ = backtest_rule(samples, rule)
+        stats, trades = backtest_rule(samples, rule)
         print_rule_stats(rule, stats)
+        print_yearly_stats(rule, trades)
 
     if do_mine:
         print(f"\n{'-' * 100}")

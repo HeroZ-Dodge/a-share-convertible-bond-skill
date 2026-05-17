@@ -34,6 +34,7 @@ import sys, os, re, json
 import unicodedata
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lib.cache_sync import ensure_jisilu_cache
 from lib.baostock_market_db import BaoStockMarketDB
 from lib.backtest_cache import BacktestCache
 from lib.strategies import registry
@@ -1856,7 +1857,7 @@ def main():
         mode_backtest(cache, combo_mode)
         return
 
-    cache.ensure_jisilu_data_for_today()
+    ensure_jisilu_cache(cache)
     backfill_stats = backfill_first_signal_history(cache)
     if backfill_stats['theory_updated'] or backfill_stats['actual_updated']:
         print(

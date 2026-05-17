@@ -19,6 +19,7 @@
 用法:
   --scan                    扫描今日注册前信号（需集思录实时数据）
   --hold                    查看模拟持仓与持仓监控
+  --sync-kline              先用 BaoStock 同步当前监控池的 K 线并落库
   --backtest                历史回测（仅 2024-01-01 及之后的已注册转债）
   --backtest --limit 100    指定样本数
   --backtest --strategy mom_recover  指定策略
@@ -28,6 +29,7 @@
 import sys, os, re, math, json
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from lib.cache_sync import ensure_jisilu_cache, sync_kline_cache
 from lib.backtest_cache import BacktestCache
 from lib.monitor_db import MonitorDB
 
@@ -60,7 +62,32 @@ class PreRegStrategy:
         return self.condition(factors)
 
 
+STRATEGY_RECOMMENDATIONS = {
+    'candidate_b': '推荐',
+    'candidate_a': '推荐(精选)',
+    'high_win': '推荐',
+    'ma5p_filter': '观察',
+    'late_momentum': '观察',
+    'mom_recover': '剔除',
+    'late_reversal': '剔除',
+    'deep_rebound': '剔除',
+    'pre3_recovery': '剔除',
+}
+
+
 PRE_REG_STRATEGIES = [
+    PreRegStrategy(
+        key='candidate_b', label='calendar_diff 20-80+pre5<=-2+mom10>=2+vol5<=0.85',
+        display_name='稳健回撤',
+        condition=lambda f: 20 <= f.get('calendar_diff', 0) <= 80 and f['pre5'] <= -2 and f['mom10'] >= 2 and f['vol5'] <= 0.85,
+        best_exit='REG', win_rate='76%', annual='挖掘候选',
+    ),
+    PreRegStrategy(
+        key='candidate_a', label='calendar_diff 20-80+pre5<=-2+mom10>=4+vol5<=0.85',
+        display_name='强势回撤',
+        condition=lambda f: 20 <= f.get('calendar_diff', 0) <= 80 and f['pre5'] <= -2 and f['mom10'] >= 4 and f['vol5'] <= 0.85,
+        best_exit='REG', win_rate='78%', annual='挖掘候选',
+    ),
     PreRegStrategy(
         key='late_reversal', label='calendar_diff 28-42+pre5<=-12+rc>=3',
         display_name='后段反转',
@@ -105,6 +132,8 @@ PRE_REG_STRATEGIES = [
     ),
 ]
 DEPRECATED_STRATEGIES = [
+    'late_reversal',    # 样本过少且TP/SL为负
+    'mom_recover',      # 信号多但TP/SL已失效
     'deep_rebound',    # sh=+0.28 胜率53.5%
     'pre3_recovery',   # sh=+0.24 胜率59.8%
 ]
@@ -344,9 +373,19 @@ def _labels_text(labels, default='—'):
     return '/'.join(items) if items else default
 
 
+def _strategy_recommendation(key):
+    """返回策略当前结论标签。"""
+    return STRATEGY_RECOMMENDATIONS.get(key, '观察')
+
+
 def _strategy_conclusion_text(strategies):
     """根据当前回测结论生成策略排序摘要"""
     names = [s.display_name for s in strategies]
+    keys = {s.key for s in strategies}
+    if {'candidate_a', 'candidate_b', 'high_win'}.issubset(keys):
+        return '结论(当前历史回测): 稳健回撤为主策略，强势回撤作为精选补充，高胜率保留为高频对照。'
+    if {'candidate_b', 'high_win'}.issubset(keys):
+        return '结论(当前历史回测): 稳健回撤为主策略，高胜率作为高频对照。'
     if {'后段反转', '后段动量'}.issubset(set(names)):
         return '结论(当前历史回测): 后段反转 > 后段动量；优先保留后段反转，后段动量作为备选。'
     if {'动量恢复', '高胜率', 'MA5过滤'}.issubset(set(names)):
@@ -1383,7 +1422,10 @@ def mode_scan(cache, strategies):
     print(f"  卖出说明: exit=REG 表示发现'同意注册'后次日卖出")
     print(f"  策略说明:")
     for s in strategies:
-        print(f"    {s.display_name}: {s.label}  (exit={s.best_exit}, 胜={s.win_rate}, 年化={s.annual})")
+        print(
+            f"    {s.display_name}: {_strategy_recommendation(s.key)} | "
+            f"{s.label}  (exit={s.best_exit}, 胜={s.win_rate}, 年化={s.annual})"
+        )
     print(f"    {_strategy_conclusion_text(strategies)}")
     print(f"  卖出: TP +{TP}% / SL {SL}%（持仓期间每日盯市，触发次日卖出）")
     print(f"  买入窗口: 上市委通过 D+{SCAN_START} 起")
@@ -1444,6 +1486,7 @@ def main():
     args = sys.argv[1:]
     mode = 'scan'
     is_backtest = False
+    sync_kline = False
     limit = None
     strategy_key = None
     buy_cmd = None
@@ -1459,6 +1502,9 @@ def main():
             i += 1
         elif args[i] == '--backtest':
             is_backtest = True
+            i += 1
+        elif args[i] == '--sync-kline':
+            sync_kline = True
             i += 1
         elif args[i] == '--limit' and i + 1 < len(args):
             limit = int(args[i + 1])
@@ -1531,7 +1577,10 @@ def main():
         ret = result.get('return_pct', 0)
         print(f"已记录卖出: {code} 卖价={price:.2f} 日期={date} 收益={ret:+.2f}%")
     else:
-        cache.ensure_jisilu_data_for_today()
+        ensure_jisilu_cache(cache)
+        if sync_kline:
+            pipeline_codes = [b.get('stock_code') for b in get_pipeline_bonds(cache)]
+            sync_kline_cache(cache, pipeline_codes)
         if mode == 'hold':
             mode_hold(cache, strategies)
         else:
